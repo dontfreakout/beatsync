@@ -8,6 +8,9 @@ use ::pipewire as pw;
 
 use super::{AppInfo, AudioBackend, AudioError, AudioIo};
 
+mod capture;
+mod media;
+mod playback;
 mod routing;
 mod thread;
 
@@ -119,10 +122,12 @@ mod tests {
     //! ```
     //!
     //! They need PipeWire 1.0+, WirePlumber 0.5+ and `pw-cat`, `pw-dump`, `pw-link`,
-    //! `pw-metadata`, `pw-cli`. They touch only what they create: their own sinks and
-    //! `pw-cat` streams that play silence from `/dev/zero`. Other streams and the default
-    //! devices stay as they are. The tests run one at a time (`LOCK`), and every child
-    //! process is killed on exit, also when a test fails.
+    //! `pw-metadata`, `pw-cli`. They touch only what they create: their own sinks, the
+    //! streamer's capture and local-copy streams (the local copy on the default output plays
+    //! silence: its ring stays empty and its gain is 0), and `pw-cat` streams that play
+    //! silence from `/dev/zero`. Other streams and the default devices stay as they are. The
+    //! tests run one at a time (`LOCK`), and every child process is killed on exit, also when
+    //! a test fails.
 
     use std::process::{Child, Command as Process, Stdio};
     use std::sync::{Arc, Mutex, MutexGuard};
@@ -130,6 +135,8 @@ mod tests {
     use serde_json::Value;
     use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
+    use super::capture::CAPTURE_NAME;
+    use super::playback::PLAYBACK_NAME;
     use super::*;
     use crate::audio::{AudioEvent, PlayoutShared};
 
@@ -137,7 +144,7 @@ mod tests {
     /// Set for the child process of `sink_disappears_when_the_owning_connection_closes`.
     const CHILD_ENV: &str = "BEATSYNC_SINK_CHILD";
 
-    fn lock() -> MutexGuard<'static, ()> {
+    pub(super) fn lock() -> MutexGuard<'static, ()> {
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -180,13 +187,13 @@ mod tests {
         ChildGuard(child)
     }
 
-    fn output(program: &str, args: &[&str]) -> String {
+    pub(super) fn output(program: &str, args: &[&str]) -> String {
         let out = Process::new(program).args(args).output().expect(program);
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
     /// `(id, node.name)` of every node in `pw-dump`.
-    fn nodes() -> Vec<(u64, String)> {
+    pub(super) fn nodes() -> Vec<(u64, String)> {
         let dump: Value = serde_json::from_str(&output("pw-dump", &[])).expect("pw-dump JSON");
         dump.as_array()
             .into_iter()
@@ -243,7 +250,7 @@ mod tests {
     }
 
     /// Ports that the output ports of node `name` link to, per `pw-link -l`.
-    fn links_from(name: &str) -> Vec<String> {
+    pub(super) fn links_from(name: &str) -> Vec<String> {
         let prefix = format!("{name}:");
         let mut links = Vec::new();
         let mut in_node = false;
@@ -262,7 +269,7 @@ mod tests {
         !links.is_empty() && links.iter().all(|p| p.starts_with(&format!("{node}:")))
     }
 
-    fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
+    pub(super) fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
         let end = Instant::now() + timeout;
         loop {
             if condition() {
@@ -596,6 +603,98 @@ mod tests {
             || matches!(events.try_recv(), Ok(AudioEvent::Failed(m)) if m.contains("refused")),
         );
         assert!(failed, "the runtime hears about the refused write");
+        backend.stop().expect("stop");
+    }
+
+    /// Ids of this process's nodes named `name`.
+    fn own_nodes(name: &str) -> Vec<u32> {
+        let dump: Value = serde_json::from_str(&output("pw-dump", &[])).expect("pw-dump JSON");
+        let objects = dump.as_array().cloned().unwrap_or_default();
+        let pid = u64::from(std::process::id());
+        // Stream nodes carry the process id only on their client.
+        let clients: Vec<u64> = objects
+            .iter()
+            .filter(|o| o["type"] == "PipeWire:Interface:Client")
+            .filter(|o| o["info"]["props"]["application.process.id"].as_u64() == Some(pid))
+            .filter_map(|o| o["id"].as_u64())
+            .collect();
+        objects
+            .iter()
+            .filter(|o| o["type"] == "PipeWire:Interface:Node")
+            .filter(|o| o["info"]["props"]["node.name"] == name)
+            .filter(|o| {
+                let client = o["info"]["props"]["client.id"].as_u64();
+                client.is_some_and(|c| clients.contains(&c))
+            })
+            .filter_map(|o| u32::try_from(o["id"].as_u64()?).ok())
+            .collect()
+    }
+
+    #[test]
+    #[ignore = "needs a live PipeWire session"]
+    fn start_captures_the_sink_and_plays_the_local_copy() {
+        let _lock = lock();
+        let backend = PipeWireBackend::new().expect("backend");
+        let (io, mut events) = test_io();
+        backend.start(Vec::new(), io).expect("start");
+        let sink = sinks_of(std::process::id()).pop().expect("sink");
+        assert!(
+            wait_until(Duration::from_secs(3), || linked_only_to(
+                &sink,
+                CAPTURE_NAME
+            )),
+            "the capture reads the sink's monitor: {:?}",
+            links_from(&sink)
+        );
+        // The test's local copy is silent: its ring stays empty and its gain is 0.
+        let default = default_sink_name();
+        assert!(
+            wait_until(Duration::from_secs(3), || linked_only_to(
+                PLAYBACK_NAME,
+                &default
+            )),
+            "the local copy plays to the default output: {:?}",
+            links_from(PLAYBACK_NAME)
+        );
+        assert_eq!(own_nodes(CAPTURE_NAME).len(), 1, "one capture stream");
+        assert_eq!(own_nodes(PLAYBACK_NAME).len(), 1, "one local copy");
+        backend.stop().expect("stop");
+        assert_eq!(
+            own_nodes(CAPTURE_NAME),
+            Vec::<u32>::new(),
+            "capture removed"
+        );
+        assert_eq!(
+            own_nodes(PLAYBACK_NAME),
+            Vec::<u32>::new(),
+            "local copy removed"
+        );
+        assert!(events.try_recv().is_err(), "no failure reported");
+    }
+
+    #[test]
+    #[ignore = "needs a live PipeWire session"]
+    fn reports_a_failed_capture_stream() {
+        let _lock = lock();
+        let backend = PipeWireBackend::new().expect("backend");
+        let (io, mut events) = test_io();
+        backend.start(Vec::new(), io).expect("start");
+        assert!(
+            wait_until(Duration::from_secs(3), || own_nodes(CAPTURE_NAME).len()
+                == 1),
+            "the capture stream exists"
+        );
+        let id = own_nodes(CAPTURE_NAME)[0].to_string();
+        output("pw-cli", &["destroy", &id]);
+        let mut message = None;
+        wait_until(Duration::from_secs(3), || {
+            if let Ok(AudioEvent::Failed(m)) = events.try_recv() {
+                message = Some(m);
+            }
+            message.is_some()
+        });
+        let message = message.expect("the runtime hears that the capture stopped");
+        assert!(message.starts_with("Audio capture"), "{message}");
         backend.stop().expect("stop");
     }
 

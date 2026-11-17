@@ -20,14 +20,20 @@ use pw::node::{Node, NodeChangeMask, NodeListener};
 use pw::properties::{PropertiesBox, properties};
 use pw::registry::{GlobalObject, RegistryRc};
 use pw::spa::utils::dict::DictRef;
+use pw::stream::StreamState;
 use pw::types::ObjectType;
 
-use super::routing::{Session, SinkGlobal, sink_properties};
+use super::capture::connect_capture;
+use super::playback::{NO_LOCAL_OUTPUT, connect_playback, local_copy_allowed};
+use super::routing::{Session, SinkGlobal, sink_name, sink_properties};
 use super::{INIT_TIMEOUT, OWN_APP_NAME, SINK_TIMEOUT, STOP_TIMEOUT};
 use crate::audio::apps::{MetaValue, StreamNode, check_versions, group_apps};
 use crate::audio::{AppInfo, AudioError, AudioIo};
 
 pub(super) type Reply<T> = mpsc::Sender<Result<T, AudioError>>;
+
+/// The `default` metadata key (subject 0) of the default output.
+const DEFAULT_SINK_KEY: &str = "default.audio.sink";
 
 pub(super) enum Command {
     ListApps(Reply<Vec<AppInfo>>),
@@ -97,6 +103,11 @@ struct Inbox {
     /// Raw seqs of `done` events for `core.sync`.
     done: Vec<i32>,
     errors: Vec<CoreError>,
+    /// New states of the capture and playback streams, by stream id.
+    stream_states: Vec<(u64, StreamState)>,
+    /// The `default.audio.sink` value of the `default` metadata (`{"name":"…"}`).
+    default_sink: Option<String>,
+    default_sink_changed: bool,
 }
 
 /// A proxy with its listener; the listener is dropped first.
@@ -295,6 +306,8 @@ struct Worker {
     lost: Option<String>,
     quit: bool,
     sinks_created: u32,
+    /// Capture and playback streams created, for their ids.
+    media_created: u64,
 }
 
 impl Worker {
@@ -321,6 +334,7 @@ impl Worker {
             lost: None,
             quit: false,
             sinks_created: 0,
+            media_created: 0,
         };
         let seq = worker.sync();
         if let Some(init) = &mut worker.init {
@@ -364,13 +378,15 @@ impl Worker {
 
     fn work(&mut self) {
         let now = Instant::now();
-        let (errors, globals, done, streams_changed) = {
+        let (errors, globals, done, streams_changed, stream_states, default_changed) = {
             let mut inbox = self.inbox.borrow_mut();
             (
                 std::mem::take(&mut inbox.errors),
                 std::mem::take(&mut inbox.globals),
                 std::mem::take(&mut inbox.done),
                 std::mem::replace(&mut inbox.streams_changed, false),
+                std::mem::take(&mut inbox.stream_states),
+                std::mem::replace(&mut inbox.default_sink_changed, false),
             )
         };
         for error in errors {
@@ -384,6 +400,10 @@ impl Worker {
         }
         if streams_changed && let Some(session) = &mut self.session {
             session.mark_dirty(now);
+        }
+        self.on_stream_states(stream_states);
+        if default_changed {
+            self.guard_local_output();
         }
         self.progress_init(&done, now);
         self.handle_commands(now);
@@ -507,10 +527,19 @@ impl Worker {
                 let inbox = self.inbox.clone();
                 move |subject, key, type_, value| {
                     let mut inbox = inbox.borrow_mut();
+                    let inbox = &mut *inbox;
+                    if subject == 0 && matches!(key, Some(DEFAULT_SINK_KEY) | None) {
+                        inbox.default_sink = value.filter(|_| key.is_some()).map(str::to_string);
+                        inbox.default_sink_changed = true;
+                    }
                     let targets = &mut inbox.targets;
                     match (key, value) {
                         // `clear()` of the whole metadata, or of one subject.
-                        (None, _) if subject == pw::constants::ID_ANY => targets.clear(),
+                        (None, _) if subject == pw::constants::ID_ANY => {
+                            targets.clear();
+                            inbox.default_sink = None;
+                            inbox.default_sink_changed = true;
+                        }
                         (None, _) => {
                             targets.remove(&subject);
                         }
@@ -530,7 +559,11 @@ impl Worker {
                 }
             })
             .register();
-        self.inbox.borrow_mut().targets.clear();
+        {
+            let mut inbox = self.inbox.borrow_mut();
+            inbox.targets.clear();
+            inbox.default_sink = None;
+        }
         self.metadata = Some(DefaultMetadata {
             id: global.id,
             proxy_id: pw::proxy::ProxyT::upcast_ref(&proxy).id(),
@@ -701,7 +734,7 @@ impl Worker {
             return;
         }
         self.sinks_created += 1;
-        let sink_name = format!("beatsync-{}-{}", std::process::id(), self.sinks_created);
+        let sink_name = sink_name(std::process::id(), self.sinks_created);
         let sink = match self
             .core
             .create_object::<Node>("adapter", &sink_properties(&sink_name))
@@ -734,6 +767,7 @@ impl Worker {
         if session.sink_global.is_some() {
             if session.answer_start(Ok(())) {
                 self.route();
+                self.start_media();
             } else {
                 // The caller stopped waiting: undo rather than keep a session nobody owns.
                 self.begin_stop(None, now);
@@ -743,6 +777,113 @@ impl Worker {
                 "The Beatsync sink did not appear".to_string(),
             )));
             self.session = None;
+        }
+    }
+
+    fn next_media_id(&mut self) -> u64 {
+        self.media_created += 1;
+        self.media_created
+    }
+
+    /// Records the stream's new states for [`Self::on_stream_states`].
+    fn state_recorder(&self, id: u64) -> impl FnMut(StreamState) + 'static {
+        let inbox = self.inbox.clone();
+        move |state| {
+            // A stream can change state while the worker holds the inbox (it disconnects a
+            // stream); that state is of a stream being dropped, so losing it is fine.
+            if let Ok(mut inbox) = inbox.try_borrow_mut() {
+                inbox.stream_states.push((id, state));
+            }
+        }
+    }
+
+    /// Creates the capture of the sink's monitor and the local copy on the default output,
+    /// once the sink exists and the first routing ran.
+    fn start_media(&mut self) {
+        let capture_id = self.next_media_id();
+        let playback_id = self.next_media_id();
+        let on_capture_state = self.state_recorder(capture_id);
+        let on_playback_state = self.state_recorder(playback_id);
+        let allowed = {
+            let inbox = self.inbox.borrow();
+            local_copy_allowed(inbox.default_sink.as_deref(), std::process::id())
+        };
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        if !session.is_routing() {
+            return;
+        }
+        let Some(ends) = session.take_ends() else {
+            return;
+        };
+        let shared = session.shared.clone();
+        let capture = connect_capture(
+            &self.core,
+            &session.sink_name,
+            ends.capture_tx,
+            shared.clone(),
+            capture_id,
+            on_capture_state,
+        );
+        match capture {
+            Ok(stream) => session.capture = Some(stream),
+            Err(e) => {
+                session.fail(&format!("Cannot capture the Beatsync sink: {e}"));
+                return;
+            }
+        }
+        if !allowed {
+            session.fail(NO_LOCAL_OUTPUT);
+            return;
+        }
+        let playback = connect_playback(
+            &self.core,
+            None,
+            ends.playout_rx,
+            shared,
+            playback_id,
+            on_playback_state,
+        );
+        match playback {
+            Ok(stream) => session.playback = Some(stream),
+            Err(e) => session.fail(&format!("Cannot play the local copy: {e}")),
+        }
+    }
+
+    /// A stream error, or a stream the server disconnected, fails the session. The dead
+    /// stream is dropped at once, so it sends nothing more to the server.
+    fn on_stream_states(&mut self, states: Vec<(u64, StreamState)>) {
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        for (id, state) in states {
+            let reason = match state {
+                StreamState::Error(message) => format!("failed: {message}"),
+                StreamState::Unconnected => "was disconnected".to_string(),
+                StreamState::Connecting | StreamState::Paused | StreamState::Streaming => continue,
+            };
+            if let Some(label) = session.remove_stream(id) {
+                session.fail(&format!("{label} {reason}"));
+            }
+        }
+    }
+
+    /// The default output became one of our sinks (for example, the last real device went
+    /// away): the local copy would loop into the capture, so it stops and the session fails.
+    fn guard_local_output(&mut self) {
+        let allowed = {
+            let inbox = self.inbox.borrow();
+            local_copy_allowed(inbox.default_sink.as_deref(), std::process::id())
+        };
+        if allowed {
+            return;
+        }
+        if let Some(session) = &mut self.session
+            && let Some(playback) = session.playback.take()
+        {
+            drop(playback);
+            session.fail(NO_LOCAL_OUTPUT);
         }
     }
 

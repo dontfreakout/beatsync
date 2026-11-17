@@ -2,6 +2,7 @@
 //! Runs on the PipeWire thread.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::time::Instant;
 
 use ::pipewire as pw;
@@ -10,13 +11,26 @@ use pw::node::Node;
 use pw::properties::{PropertiesBox, properties};
 
 use super::ROUTE_DEBOUNCE;
+use super::capture::CaptureStream;
+use super::playback::PlaybackStream;
 use super::thread::Reply;
 use crate::audio::apps::{
     MetaValue, RouteAction, StreamNode, app_key, moved_away, routing_actions,
 };
-use crate::audio::{AudioError, AudioEvent, AudioIo};
+use crate::audio::{AudioError, AudioEvent, AudioIo, CapturedChunk, PlayoutShared};
+use crate::playout::PcmBlock;
 
 const TARGET_OBJECT: &str = "target.object";
+
+/// `node.name` of the `n`-th sink of process `pid`.
+pub(super) fn sink_name(pid: u32, n: u32) -> String {
+    format!("beatsync-{pid}-{n}")
+}
+
+/// Whether `node_name` is a sink of process `pid` (any run).
+pub(super) fn is_own_sink(node_name: &str, pid: u32) -> bool {
+    node_name.starts_with(&format!("beatsync-{pid}-"))
+}
 
 /// Properties of the sink. Unique per process and start, so WirePlumber's stream-restore,
 /// which remembers targets by `node.name`, never sends a stream to a later sink. No
@@ -62,8 +76,18 @@ pub(super) struct Session {
     /// Answered when the sink shows up in the registry.
     pub pending_start: Option<(Instant, Reply<()>)>,
     failed: bool,
-    /// Capture and playback ends; Task 12 uses them on this thread.
-    io: AudioIo,
+    events: tokio::sync::mpsc::UnboundedSender<AudioEvent>,
+    pub shared: Arc<PlayoutShared>,
+    /// The ring ends, until the capture and the playback stream take them.
+    ends: Option<MediaEnds>,
+    pub capture: Option<CaptureStream>,
+    pub playback: Option<PlaybackStream>,
+}
+
+/// The ring ends of the real-time streams.
+pub(super) struct MediaEnds {
+    pub capture_tx: rtrb::Producer<CapturedChunk>,
+    pub playout_rx: rtrb::Consumer<PcmBlock>,
 }
 
 impl Session {
@@ -76,6 +100,12 @@ impl Session {
         reply: Reply<()>,
     ) -> Self {
         let sink_proxy_id = pw::proxy::ProxyT::upcast_ref(&sink).id();
+        let AudioIo {
+            capture_tx,
+            playout_rx,
+            shared,
+            events,
+        } = io;
         Self {
             sink_name,
             sink: Some(sink),
@@ -87,7 +117,14 @@ impl Session {
             route_at: None,
             pending_start: Some((start_deadline, reply)),
             failed: false,
-            io,
+            events,
+            shared,
+            ends: Some(MediaEnds {
+                capture_tx,
+                playout_rx,
+            }),
+            capture: None,
+            playback: None,
         }
     }
 
@@ -139,7 +176,7 @@ impl Session {
     pub fn fail(&mut self, message: &str) {
         if !self.failed {
             self.failed = true;
-            let _ = self.io.events.send(AudioEvent::Failed(message.to_string()));
+            let _ = self.events.send(AudioEvent::Failed(message.to_string()));
         }
     }
 
@@ -212,6 +249,24 @@ impl Session {
         }
     }
 
+    /// The ring ends for the streams; `None` once taken.
+    pub fn take_ends(&mut self) -> Option<MediaEnds> {
+        self.ends.take()
+    }
+
+    /// Drops the stream with `id` if it is one of this session's, and says what it was.
+    pub fn remove_stream(&mut self, id: u64) -> Option<&'static str> {
+        if self.capture.as_ref().is_some_and(|s| s.id == id) {
+            drop(self.capture.take());
+            Some("Audio capture")
+        } else if self.playback.as_ref().is_some_and(|s| s.id == id) {
+            drop(self.playback.take());
+            Some("The local copy")
+        } else {
+            None
+        }
+    }
+
     /// Answers a pending start with `result`; false when its caller no longer waits.
     pub fn answer_start(&mut self, result: Result<(), AudioError>) -> bool {
         self.pending_start
@@ -225,6 +280,9 @@ impl Drop for Session {
         self.answer_start(Err(AudioError::Backend(
             "Audio routing stopped before the sink was ready".to_string(),
         )));
+        // The streams go first, so the capture never sees its target vanish.
+        drop(self.playback.take());
+        drop(self.capture.take());
         // A non-lingering adapter node lives as long as the resource bound to its proxy, so
         // destroying the proxy destroys the sink on the server.
         drop(self.sink.take());

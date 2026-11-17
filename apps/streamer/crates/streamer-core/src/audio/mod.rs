@@ -3,7 +3,7 @@
 
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use serde::Serialize;
 
@@ -81,10 +81,22 @@ pub struct PlayoutShared {
     pub server_offset_ms: AtomicU64,
     /// f64 bits: local clock time minus CLOCK_MONOTONIC time, in ms.
     pub mono_epoch_offset_ms: AtomicU64,
-    /// f32 bits: output gain of the local copy.
+    /// f32 bits: output gain of the local copy. 0 (the default) is silence.
     pub gain: AtomicU32,
     /// f32 bits: ramp duration of gain changes, in s.
     pub gain_ramp_s: AtomicU32,
+    /// Captured chunks the capture callback dropped (full ring or no timing).
+    pub capture_dropped: AtomicU64,
+}
+
+impl PlayoutShared {
+    /// Server time in ms of a CLOCK_MONOTONIC time: `epoch = mono + mono_epoch_offset_ms`,
+    /// `server = epoch + server_offset_ms`. Real-time safe.
+    pub fn mono_to_server_ms(&self, mono_ns: i64) -> f64 {
+        let load = |a: &AtomicU64| f64::from_bits(a.load(Ordering::Relaxed));
+        let epoch_ms = mono_ns as f64 / 1_000_000.0 + load(&self.mono_epoch_offset_ms);
+        epoch_ms + load(&self.server_offset_ms)
+    }
 }
 
 /// The audio ends the backend owns while started; the runtime creates one per `start`.
@@ -99,11 +111,36 @@ pub trait AudioBackend: Send + Sync {
     /// Apps that play audio now, sorted by name, without the streamer itself.
     fn list_apps(&self) -> Result<Vec<AppInfo>, AudioError>;
     /// Creates the sink and moves the streams of `apps` (names from [`AppInfo::name`]) to it.
+    /// Then captures the sink into `io.capture_tx` and plays `io.playout_rx` on the default
+    /// output (the local copy). Failures after the answer arrive as [`AudioEvent::Failed`].
     fn start(&self, apps: Vec<String>, io: AudioIo) -> Result<(), AudioError>;
     /// Changes the selection while started; does nothing when stopped.
     fn update_apps(&self, apps: Vec<String>) -> Result<(), AudioError>;
-    /// Moves the streams back, clears the app's routing entries and removes the sink. A stream
-    /// the user moved elsewhere meanwhile keeps the user's target. Returns when this is done;
-    /// does nothing when stopped.
+    /// Stops the capture and the local copy, moves the streams back, clears the app's routing
+    /// entries and removes the sink. A stream the user moved elsewhere meanwhile keeps the
+    /// user's target. Returns when this is done; does nothing when stopped.
     fn stop(&self) -> Result<(), AudioError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mono_to_server_adds_both_offsets() {
+        // A sign error here shifts the local copy against the room.
+        let shared = PlayoutShared::default();
+        let epoch_offset = 1_700_000_000_000.0_f64;
+        shared
+            .mono_epoch_offset_ms
+            .store(epoch_offset.to_bits(), Ordering::Relaxed);
+        shared
+            .server_offset_ms
+            .store((-50.0_f64).to_bits(), Ordering::Relaxed);
+        let server = shared.mono_to_server_ms(2_000_000_000);
+        assert!(
+            (server - (epoch_offset + 2000.0 - 50.0)).abs() < 1e-3,
+            "{server}"
+        );
+    }
 }
