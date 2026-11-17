@@ -162,6 +162,8 @@ h2 {
 .error {
   margin: 0;
   color: var(--error);
+  /* A backend error can carry its reason on a second line. */
+  white-space: pre-line;
 }
 
 .status {

@@ -71,7 +71,8 @@ async fn main() -> ExitCode {
     let backend = match new_backend().await {
         Ok(backend) => backend,
         Err(e) => {
-            // UnsupportedVersions prints exactly the required-versions message.
+            // Too old versions and no PipeWire server both print the exact required-versions
+            // sentence (no server adds the reason on a second line).
             eprintln!("{e}");
             return ExitCode::FAILURE;
         }

@@ -26,11 +26,15 @@ pub struct AppInfo {
     pub streams: usize,
 }
 
+/// The user-facing error when the audio system does not fit (spec §9.9, exact copy).
+pub const REQUIRED_VERSIONS: &str = "PipeWire 1.0 and WirePlumber 0.5 or later required";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AudioError {
     /// PipeWire or WirePlumber is too old, or WirePlumber is not running.
     UnsupportedVersions,
-    /// No PipeWire server to connect to.
+    /// No PipeWire server to connect to (e.g. a PulseAudio-only system). Shown as
+    /// [`REQUIRED_VERSIONS`], with the reason on a second line.
     Unavailable(String),
     /// `start` while routing is already started.
     AlreadyStarted,
@@ -41,10 +45,13 @@ pub enum AudioError {
 impl fmt::Display for AudioError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnsupportedVersions => {
-                f.write_str("PipeWire 1.0 and WirePlumber 0.5 or later required")
+            Self::UnsupportedVersions => f.write_str(REQUIRED_VERSIONS),
+            Self::Unavailable(reason) => {
+                write!(
+                    f,
+                    "{REQUIRED_VERSIONS}\nPipeWire is not available: {reason}"
+                )
             }
-            Self::Unavailable(reason) => write!(f, "PipeWire is not available: {reason}"),
             Self::AlreadyStarted => f.write_str("Audio routing is already started"),
             Self::Backend(message) => f.write_str(message),
         }
@@ -125,6 +132,22 @@ pub trait AudioBackend: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_pipewire_server_shows_the_required_versions() {
+        // Spec §9.9: a PulseAudio-only system shows exactly this sentence; the reason follows
+        // on a second line.
+        let text =
+            AudioError::Unavailable("cannot connect to the PipeWire server: x".into()).to_string();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines,
+            [
+                "PipeWire 1.0 and WirePlumber 0.5 or later required",
+                "PipeWire is not available: cannot connect to the PipeWire server: x",
+            ]
+        );
+    }
 
     #[test]
     fn mono_to_server_adds_both_offsets() {
