@@ -1,4 +1,5 @@
 pub mod clock;
+pub mod connection;
 pub mod encoder;
 pub mod engine;
 pub mod frame;
