@@ -108,6 +108,8 @@ struct Inbox {
     /// The `default.audio.sink` value of the `default` metadata (`{"name":"…"}`).
     default_sink: Option<String>,
     default_sink_changed: bool,
+    /// A `target.object` entry changed.
+    targets_changed: bool,
 }
 
 /// A proxy with its listener; the listener is dropped first.
@@ -389,6 +391,9 @@ impl Worker {
                 std::mem::replace(&mut inbox.default_sink_changed, false),
             )
         };
+        let targets_changed =
+            std::mem::replace(&mut self.inbox.borrow_mut().targets_changed, false);
+        let routing_inputs_changed = !globals.is_empty() || streams_changed || targets_changed;
         for error in errors {
             self.on_error(error);
         }
@@ -408,6 +413,9 @@ impl Worker {
         self.progress_init(&done, now);
         self.handle_commands(now);
         self.progress_start(now);
+        if routing_inputs_changed {
+            self.route_at_once(now);
+        }
         self.route_if_due(now);
         self.progress_stop(&done, now);
         // A start that waited for a stop finished above runs now, not at some later wake-up.
@@ -513,6 +521,7 @@ impl Worker {
             },
         );
         if let Some(session) = &mut self.session {
+            session.note_added(global.id, now);
             session.mark_dirty(now);
         }
     }
@@ -539,9 +548,11 @@ impl Worker {
                             targets.clear();
                             inbox.default_sink = None;
                             inbox.default_sink_changed = true;
+                            inbox.targets_changed = true;
                         }
                         (None, _) => {
                             targets.remove(&subject);
+                            inbox.targets_changed = true;
                         }
                         (Some("target.object"), Some(value)) => {
                             let entry = MetaValue {
@@ -549,9 +560,11 @@ impl Worker {
                                 value: value.to_string(),
                             };
                             targets.insert(subject, entry);
+                            inbox.targets_changed = true;
                         }
                         (Some("target.object"), None) => {
                             targets.remove(&subject);
+                            inbox.targets_changed = true;
                         }
                         _ => {}
                     }
@@ -766,7 +779,7 @@ impl Worker {
         };
         if session.sink_global.is_some() {
             if session.answer_start(Ok(())) {
-                self.route();
+                self.route(now);
                 self.start_media();
             } else {
                 // The caller stopped waiting: undo rather than keep a session nobody owns.
@@ -887,22 +900,33 @@ impl Worker {
         }
     }
 
+    /// Routes now, not after the debounce, when a stream of a selected app is not on the sink
+    /// yet (see [`Session::wants_route_now`]). Called after streams or targets changed.
+    fn route_at_once(&mut self, now: Instant) {
+        let Some(session) = &self.session else { return };
+        let nodes = self.foreign_streams();
+        let wants = session.wants_route_now(&nodes, &self.inbox.borrow().targets, now);
+        if wants {
+            self.route(now);
+        }
+    }
+
     fn route_if_due(&mut self, now: Instant) {
         if let Some(session) = &mut self.session
             && session.take_due(now)
         {
-            self.route();
+            self.route(now);
         }
     }
 
-    fn route(&mut self) {
+    fn route(&mut self, now: Instant) {
         let nodes = self.foreign_streams();
         let (Some(session), Some(metadata)) = (&mut self.session, &self.metadata) else {
             return;
         };
         if session.is_routing() {
             let mut inbox = self.inbox.borrow_mut();
-            session.route(&metadata.bound.proxy, &nodes, &mut inbox.targets);
+            session.route(&metadata.bound.proxy, &nodes, &mut inbox.targets, now);
         }
     }
 
@@ -922,7 +946,7 @@ impl Worker {
             && let Some(metadata) = &self.metadata
         {
             let mut inbox = self.inbox.borrow_mut();
-            session.restore_all(&metadata.bound.proxy, &mut inbox.targets);
+            session.restore_all(&metadata.bound.proxy, &mut inbox.targets, now);
         }
         drop(session);
         let sync = if self.lost.is_none() {

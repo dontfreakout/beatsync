@@ -26,8 +26,13 @@ const INIT_TIMEOUT: Duration = Duration::from_secs(2);
 const SINK_TIMEOUT: Duration = Duration::from_secs(2);
 /// Wait for the server to confirm the restore and the sink removal.
 const STOP_TIMEOUT: Duration = Duration::from_secs(2);
-/// Routing runs this long after a stream appears, changes or vanishes, or the selection changes.
+/// Routing runs this long after a stream appears, changes or vanishes, or the selection
+/// changes. A stream of a selected app that is not on the sink yet is routed at once.
 const ROUTE_DEBOUNCE: Duration = Duration::from_millis(200);
+/// A new stream's `target.object` entry that changes this soon after the stream appeared was
+/// written by WirePlumber's stream-restore (it reacts to new streams a little after the
+/// streamer), not by the user: the stream is moved to the sink again.
+const RESTORE_RACE: Duration = Duration::from_secs(1);
 /// Longer than every wait of the thread, so a reply only times out when the thread hangs.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(4);
 
@@ -467,6 +472,117 @@ mod tests {
         let id = node_id(&app).expect("stream node");
         assert_eq!(metadata_line(id, "target.object"), None);
         backend.stop().expect("stop");
+        assert!(events.try_recv().is_err(), "no failure reported");
+    }
+
+    /// Polls `pw-link -l` (about 5 ms per call) from now until `stream` links only to `sink`,
+    /// and returns how long it was linked elsewhere before that, with the samples.
+    fn time_linked_elsewhere(stream: &str, sink: &str) -> (Duration, Vec<String>) {
+        let begin = Instant::now();
+        let mut first_link: Option<Instant> = None;
+        let mut samples = Vec::new();
+        while begin.elapsed() < Duration::from_secs(3) {
+            let links = links_from(stream);
+            let at = Instant::now();
+            samples.push(format!(
+                "{:>6.1} ms {links:?}",
+                (at - begin).as_secs_f64() * 1e3
+            ));
+            if links.is_empty() {
+                continue;
+            }
+            let first = *first_link.get_or_insert(at);
+            if links.iter().all(|p| p.starts_with(&format!("{sink}:"))) {
+                return (at - first, samples);
+            }
+        }
+        panic!("{stream} never linked only to {sink}: {samples:#?}");
+    }
+
+    #[test]
+    #[ignore = "needs a live PipeWire session"]
+    fn new_stream_of_a_selected_app_goes_to_the_sink_at_once() {
+        let _lock = lock();
+        let app = format!("beatsync-test-{}", std::process::id());
+        let backend = PipeWireBackend::new().expect("backend");
+        let (io, mut events) = test_io();
+        backend.start(vec![app.clone()], io).expect("start");
+        let sink = sinks_of(std::process::id()).pop().expect("sink");
+
+        // E.g. a browser tab that resumes: until the move, the app is heard undelayed.
+        let _tone = play_silence(&app);
+        let (elsewhere, samples) = time_linked_elsewhere(&app, &sink);
+        eprintln!("linked elsewhere for {elsewhere:?}: {samples:#?}");
+        assert!(
+            elsewhere <= Duration::from_millis(50),
+            "linked elsewhere for {elsewhere:?}: {samples:#?}"
+        );
+        backend.stop().expect("stop");
+        assert!(events.try_recv().is_err(), "no failure reported");
+    }
+
+    #[test]
+    #[ignore = "needs a live PipeWire session"]
+    fn target_restored_right_after_a_new_stream_appears_is_overridden() {
+        let _lock = lock();
+        let app = format!("beatsync-test-{}", std::process::id());
+        let backend = PipeWireBackend::new().expect("backend");
+        let (io, mut events) = test_io();
+        backend.start(vec![app.clone()], io).expect("start");
+        let sink = sinks_of(std::process::id()).pop().expect("sink");
+        let sink_serial = node_serial(&sink).expect("sink serial").to_string();
+        let default = default_sink_name();
+        let serial = node_serial(&default)
+            .expect("default sink serial")
+            .to_string();
+
+        let _tone = play_silence(&app);
+        let mut id = None;
+        assert!(
+            wait_until(Duration::from_secs(3), || {
+                id = node_id(&app);
+                id.is_some()
+            }),
+            "the stream appears"
+        );
+        let id = id.expect("stream node");
+        // What WirePlumber's stream-restore does for an app with a remembered target, a
+        // moment after the stream appeared: after the streamer's own move.
+        let subject = id.to_string();
+        let args = [
+            "-n",
+            "default",
+            "--",
+            &subject,
+            "target.object",
+            &serial,
+            "Spa:Id",
+        ];
+        output("pw-metadata", &args);
+        let on_sink = || {
+            let line = metadata_line(id, "target.object");
+            line.is_some_and(|l| l.contains(&format!("value:'{sink_serial}'")))
+                && linked_only_to(&app, &sink)
+        };
+        assert!(
+            wait_until(Duration::from_secs(3), on_sink),
+            "moved to the sink again: {:?} {:?}",
+            metadata_line(id, "target.object"),
+            links_from(&app)
+        );
+        // Still there after a routing pass: the restore was not taken for a user's move.
+        backend.update_apps(vec![app.clone()]).expect("update_apps");
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(on_sink(), "{:?}", metadata_line(id, "target.object"));
+
+        backend.stop().expect("stop");
+        let restored = metadata_line(id, "target.object");
+        assert!(
+            restored
+                .as_ref()
+                .is_some_and(|l| l.contains(&format!("value:'{serial}'"))),
+            "the restored target is the one to go back to: {restored:?}"
+        );
         assert!(events.try_recv().is_err(), "no failure reported");
     }
 
