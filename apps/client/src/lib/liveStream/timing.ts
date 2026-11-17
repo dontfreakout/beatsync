@@ -36,3 +36,16 @@ export function canScheduleLiveAudio(p: {
 }): boolean {
   return p.isSynced && !p.isInitingSystem && p.contextState === "running" && p.playHere;
 }
+
+/**
+ * A frame whose play time (capture + delay) passed more than one frame ago, e.g. in the
+ * burst of buffered frames after a background tab resumes. Decoding it only yields a late drop.
+ */
+export function isFrameExpired(p: {
+  captureServerTimeMs: number;
+  delayMs: number;
+  frameDurationMs: number;
+  nowServerMs: number;
+}): boolean {
+  return p.nowServerMs - (p.captureServerTimeMs + p.delayMs) > p.frameDurationMs;
+}

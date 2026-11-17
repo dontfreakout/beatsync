@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { calculateLocalDelayMs } from "@/utils/ntp";
-import { canScheduleLiveAudio, computeBlockIdealStartSec } from "../timing";
+import { canScheduleLiveAudio, computeBlockIdealStartSec, isFrameExpired } from "../timing";
 
 describe("calculateLocalDelayMs", () => {
   const base = { targetServerTimeMs: 10_000, nowEpochMs: 9_000, offsetEstimateMs: 0, nudgeMs: 0, outputLatencyMs: 0 };
@@ -49,5 +49,21 @@ describe("canScheduleLiveAudio", () => {
 
   it("stays silent behind the Start screen even when the context runs", () => {
     expect(canScheduleLiveAudio({ ...ready, isInitingSystem: true })).toBe(false);
+  });
+});
+
+describe("isFrameExpired", () => {
+  // Play time = capture + delay = 6000
+  const base = { captureServerTimeMs: 5000, delayMs: 1000, frameDurationMs: 20 };
+
+  it("keeps frames whose play time is ahead or passed by at most one frame", () => {
+    expect(isFrameExpired({ ...base, nowServerMs: 5500 })).toBe(false);
+    expect(isFrameExpired({ ...base, nowServerMs: 6000 })).toBe(false);
+    expect(isFrameExpired({ ...base, nowServerMs: 6020 })).toBe(false);
+  });
+
+  it("skips frames whose play time passed by more than one frame (stale burst after a tab resume)", () => {
+    expect(isFrameExpired({ ...base, nowServerMs: 6021 })).toBe(true);
+    expect(isFrameExpired({ ...base, nowServerMs: 9000 })).toBe(true);
   });
 });

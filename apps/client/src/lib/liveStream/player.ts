@@ -1,7 +1,7 @@
 import { audioContextManager } from "@/lib/audioContextManager";
 import { createOpusDecoder, type DecodedBlock, type OpusDecoderHandle } from "@/lib/liveStream/decoder";
 import { LateFrameMonitor, LiveScheduler } from "@/lib/liveStream/scheduler";
-import { canScheduleLiveAudio, computeBlockIdealStartSec } from "@/lib/liveStream/timing";
+import { canScheduleLiveAudio, computeBlockIdealStartSec, isFrameExpired } from "@/lib/liveStream/timing";
 import { getFilteredOutputLatencyMs, useGlobalStore } from "@/store/global";
 import { type LiveStreamStatus, useLiveStreamStore } from "@/store/liveStream";
 import { decodeLiveFrame, epochNow, LIVE_STREAM_CONSTANTS, type LiveStreamType } from "@beatsync/shared";
@@ -40,6 +40,7 @@ interface Session {
   retryTimer: ReturnType<typeof setTimeout> | null;
   /** From DECODER_FAILURES_BEFORE_WASM on, the session uses the WASM decoder */
   decoderFailures: number;
+  unsubscribeNudge: () => void;
 }
 
 export interface LiveStreamStats {
@@ -74,12 +75,17 @@ class LiveStreamPlayer {
     if (!frame || frame.header.streamId !== session.stream.streamId) return;
 
     const { sequence, captureServerTimeMs } = frame.header;
+    session.lastFrameAt = Date.now();
+    // Not decoded and not counted as late: a stale burst (e.g. after a tab resume) would fake "too slow"
+    const { delayMs, frameDurationMs } = session.stream;
+    const nowServerMs = epochNow() + useGlobalStore.getState().offsetEstimate;
+    if (isFrameExpired({ captureServerTimeMs, delayMs, frameDurationMs, nowServerMs })) return;
+
     session.captureTimes.set(sequence, captureServerTimeMs);
     for (const [seq, captureMs] of session.captureTimes) {
       if (captureMs >= captureServerTimeMs - CAPTURE_TIME_RETENTION_MS) break;
       session.captureTimes.delete(seq);
     }
-    session.lastFrameAt = Date.now();
     decoder.decode(sequence, frame.payload);
   }
 
@@ -104,10 +110,16 @@ class LiveStreamPlayer {
       captureTimes: new Map(),
       nodes: new Set(),
       queuedEndSec: 0,
-      lastFrameAt: 0,
+      // Counts from the start, so "waiting" does not flash before the first frame arrives
+      lastFrameAt: Date.now(),
       statusTimer: setInterval(() => this.updateStatus(session), STATUS_INTERVAL_MS),
       retryTimer: null,
       decoderFailures: 0,
+      // A nudge step (10-100 ms) is below the restart threshold: the drift correction would
+      // apply it at 0.1 % (seconds per step). A restart applies it at once, like file playback.
+      unsubscribeNudge: useGlobalStore.subscribe((state, prev) => {
+        if (state.nudgeOffsetMs !== prev.nudgeOffsetMs) session.scheduler.reset();
+      }),
     };
     this.session = session;
     this.stats = { received: 0, decoded: 0, played: 0, droppedLate: 0, droppedStale: 0 };
@@ -121,6 +133,7 @@ class LiveStreamPlayer {
     if (!session) return;
     this.session = null;
     clearInterval(session.statusTimer);
+    session.unsubscribeNudge();
     if (session.retryTimer) clearTimeout(session.retryTimer);
     this.stopNodes(session);
     session.decoder?.close();
