@@ -65,7 +65,14 @@ pub fn build_ws_url(
         "ws" | "wss" => {}
         other => return Err(ConnError::UnsupportedScheme(other.to_string())),
     }
+    let kept: Vec<(String, String)> = url
+        .query_pairs()
+        .filter(|(k, _)| !matches!(k.as_ref(), "roomId" | "username" | "clientId" | "kind"))
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    url.set_query(None);
     url.query_pairs_mut()
+        .extend_pairs(kept)
         .append_pair("roomId", room)
         .append_pair("username", username)
         .append_pair("clientId", client_id)
@@ -73,6 +80,8 @@ pub fn build_ws_url(
     Ok(url.into())
 }
 
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 const BACKOFF_SECS: [u64; 5] = [1, 2, 4, 8, 10];
 
 fn install_crypto_provider() {
@@ -141,7 +150,7 @@ async fn session(
         let mut to_send: Vec<Message> = Vec::new();
         tokio::select! {
             _ = wait_shutdown(shutdown) => {
-                let _ = write.send(Message::Close(None)).await;
+                let _ = tokio::time::timeout(CLOSE_TIMEOUT, write.send(Message::Close(None))).await;
                 return SessionEnd::Shutdown;
             }
             _ = probe_wait => {
@@ -192,8 +201,16 @@ async fn session(
             },
         }
         for m in to_send {
-            if write.send(m).await.is_err() {
-                return SessionEnd::Lost;
+            tokio::select! {
+                _ = wait_shutdown(shutdown) => {
+                    let _ = tokio::time::timeout(CLOSE_TIMEOUT, write.send(Message::Close(None))).await;
+                    return SessionEnd::Shutdown;
+                }
+                r = tokio::time::timeout(WRITE_TIMEOUT, write.send(m)) => {
+                    if !matches!(r, Ok(Ok(()))) {
+                        return SessionEnd::Lost;
+                    }
+                }
             }
         }
     }
@@ -334,6 +351,43 @@ mod tests {
         assert!(!u.contains("a b&c"));
         assert!(build_ws_url("http://example.com/ws", "1", "u", "c").is_err());
         assert!(build_ws_url("not a url", "1", "u", "c").is_err());
+    }
+
+    #[test]
+    fn url_replaces_reserved_keys_from_base() {
+        let u = build_ws_url(
+            "wss://h/ws?roomId=1&x=1&kind=old&username=z&clientId=q",
+            "2",
+            "u",
+            "c",
+        )
+        .unwrap();
+        let pairs: Vec<(String, String)> = url::Url::parse(&u)
+            .unwrap()
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        let keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["x", "roomId", "username", "clientId", "kind"]);
+        assert_eq!(pairs[1].1, "2");
+        assert_eq!(pairs[4].1, "streamer");
+    }
+
+    #[tokio::test]
+    async fn shutdown_returns_while_the_peer_stops_reading() {
+        let mut h = harness().await;
+        let _ws = accept(&h.listener).await; // never read
+        assert!(matches!(next_ev(&mut h).await, ConnEvent::Connected));
+        let tx = h.out_tx.clone();
+        tokio::spawn(
+            async move { while tx.send(Outgoing::Binary(vec![0u8; 65536])).await.is_ok() {} },
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        h.shutdown_tx.send(true).unwrap();
+        timeout(Duration::from_secs(2), h.task)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
