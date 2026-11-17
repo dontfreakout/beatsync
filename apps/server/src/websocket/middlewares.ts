@@ -31,15 +31,18 @@ export const requireRoomAdmin = (ws: ServerWebSocket<WSData>): { room: RoomManag
   return { room };
 };
 
+export const canClientMutate = (room: RoomManager, clientId: string): boolean => {
+  const client = room.getClient(clientId);
+  if (!client) return false;
+  return room.getPlaybackControlsPermissions() === PlaybackControlsPermissionsEnum.enum.EVERYONE || client.isAdmin;
+};
+
 export const requireCanMutate = (ws: ServerWebSocket<WSData>): { room: RoomManager } => {
   const { room } = requireRoom(ws);
   const client = room.getClient(ws.data.clientId);
   if (!client) throw new Error(`Client ${ws.data.clientId} does not exist in room ${ws.data.roomId}`);
 
-  const canMutate =
-    room.getPlaybackControlsPermissions() === PlaybackControlsPermissionsEnum.enum.EVERYONE || client.isAdmin;
-
-  if (!canMutate) {
+  if (!canClientMutate(room, ws.data.clientId)) {
     throw new Error(`Client ${ws.data.clientId} does not have permission to mutate in room ${ws.data.roomId}`);
   }
 

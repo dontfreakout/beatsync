@@ -26,10 +26,16 @@ const LivenessPingMessageSchema = z.object({
   type: z.literal(ServerActionEnum.enum.LIVENESS_PING),
 });
 
+const LiveStreamRejectedSchema = z.object({
+  type: z.literal(ServerActionEnum.enum.LIVE_STREAM_REJECTED),
+  reason: z.enum(["NOT_ALLOWED", "ALREADY_ACTIVE"]),
+});
+
 export const WSUnicastSchema = z.discriminatedUnion("type", [
   NTPResponseMessageSchema,
   ScheduledActionSchema,
   MusicSearchResponseSchema,
   LivenessPingMessageSchema,
+  LiveStreamRejectedSchema,
 ]);
 export type WSUnicastType = z.infer<typeof WSUnicastSchema>;

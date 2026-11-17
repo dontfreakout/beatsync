@@ -12,12 +12,14 @@ import type {
   ChatMessageType,
   ClientDataType,
   DiscoveryRoomType,
+  LiveStreamType,
   PauseActionType,
   PlayActionType,
   PlaybackControlsPermissionsEnum,
   PlaybackControlsPermissionsType,
   PositionType,
   RoomType,
+  StartLiveStreamType,
   WSBroadcastType,
 } from "@beatsync/shared";
 import { ChatMessageSchema, ClientDataSchema, epochNow, LOW_PASS_CONSTANTS, NTP_CONSTANTS } from "@beatsync/shared";
@@ -127,6 +129,9 @@ export class RoomManager {
   private activeStreamJobs = new Map<string, { status: string }>();
   private chatManager: ChatManager;
   private serverRef?: BunServer;
+  // Live stream state is ephemeral: not part of createBackup()
+  private liveStream?: { state: LiveStreamType; server: BunServer };
+  private nextLiveStreamId = 1; // never reused during the room's lifetime
 
   // Audio loading state for synchronized playback
   private pendingPlay?: PendingPlayState;
@@ -313,6 +318,89 @@ export class RoomManager {
     return this.playbackState;
   }
 
+  getLiveStream(): LiveStreamType | null {
+    return this.liveStream?.state ?? null;
+  }
+
+  /**
+   * Start a live stream from a source client. Replaces any active stream, cancels
+   * a pending play and pauses a playing queue at its current position.
+   */
+  startLiveStream({
+    sourceClientId,
+    request,
+    server,
+  }: {
+    sourceClientId: string;
+    request: StartLiveStreamType;
+    server: BunServer;
+  }): LiveStreamType {
+    this.clearAudioLoadingState();
+    this.pauseQueueForLiveStream(server);
+
+    const state: LiveStreamType = {
+      streamId: this.nextLiveStreamId++,
+      sourceClientId,
+      sourceUsername: this.clientData.get(sourceClientId)?.username ?? "",
+      label: request.label,
+      codec: request.codec,
+      sampleRate: request.sampleRate,
+      channels: request.channels,
+      frameDurationMs: request.frameDurationMs,
+      delayMs: request.delayMs,
+      startedAt: epochNow(),
+    };
+    this.liveStream = { state, server };
+    console.log(`Room ${this.roomId}: live stream ${state.streamId} started by ${sourceClientId}`);
+    this.broadcastLiveStreamState();
+    return state;
+  }
+
+  updateLiveStreamLabel(label: string): void {
+    if (!this.liveStream) return;
+    this.liveStream.state = { ...this.liveStream.state, label };
+    this.broadcastLiveStreamState();
+  }
+
+  stopLiveStream(opts: { stoppedByClientId?: string } = {}): void {
+    if (!this.liveStream) return;
+    const { server, state } = this.liveStream;
+    this.liveStream = undefined;
+    console.log(`Room ${this.roomId}: live stream ${state.streamId} stopped`);
+    sendBroadcast({
+      server,
+      roomId: this.roomId,
+      message: {
+        type: "ROOM_EVENT",
+        event: { type: "LIVE_STREAM_STATE", stream: null, stoppedByClientId: opts.stoppedByClientId },
+      },
+    });
+  }
+
+  private broadcastLiveStreamState(): void {
+    if (!this.liveStream) return;
+    sendBroadcast({
+      server: this.liveStream.server,
+      roomId: this.roomId,
+      message: { type: "ROOM_EVENT", event: { type: "LIVE_STREAM_STATE", stream: this.liveStream.state } },
+    });
+  }
+
+  private pauseQueueForLiveStream(server: BunServer): void {
+    const { playbackState } = this;
+    if (playbackState.type !== "playing") return;
+    const serverTimeToExecute = this.getScheduledExecutionTime();
+    const trackTimeSeconds =
+      playbackState.trackPositionSeconds + (serverTimeToExecute - playbackState.serverTimeToExecute) / 1000;
+    const pause: PauseActionType = { type: "PAUSE", audioSource: playbackState.audioSource, trackTimeSeconds };
+    this.updatePlaybackSchedulePause(pause, serverTimeToExecute);
+    sendBroadcast({
+      server,
+      roomId: this.roomId,
+      message: { type: "SCHEDULED_ACTION", scheduledAction: pause, serverTimeToExecute },
+    });
+  }
+
   /**
    * Add a client to the room
    */
@@ -378,6 +466,9 @@ export class RoomManager {
   removeClient(clientId: string): void {
     // Only remove from wsConnections, keep clientData for rejoin scenarios
     this.wsConnections.delete(clientId);
+    if (this.liveStream?.state.sourceClientId === clientId) {
+      this.stopLiveStream();
+    }
     if (this.demoAudioReadyClients.delete(clientId)) {
       this.debouncedAudioReady();
     }

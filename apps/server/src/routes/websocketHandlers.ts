@@ -79,6 +79,14 @@ export const handleOpen = (ws: ServerWebSocket<WSData>, server: BunServer) => {
     },
   });
 
+  const liveStream = room.getLiveStream();
+  if (liveStream) {
+    sendToClient({
+      ws,
+      message: { type: "ROOM_EVENT", event: { type: "LIVE_STREAM_STATE", stream: liveStream } },
+    });
+  }
+
   sendUnicast({
     ws,
     message: {
