@@ -37,11 +37,17 @@ describe("computeBlockIdealStartSec", () => {
 });
 
 describe("canScheduleLiveAudio", () => {
+  const ready = { isSynced: true, isInitingSystem: false, contextState: "running", playHere: true };
+
   it("requires synced, running context and playHere", () => {
-    expect(canScheduleLiveAudio({ isSynced: false, contextState: "running", playHere: true })).toBe(false);
-    expect(canScheduleLiveAudio({ isSynced: true, contextState: "suspended", playHere: true })).toBe(false);
-    expect(canScheduleLiveAudio({ isSynced: true, contextState: "interrupted", playHere: true })).toBe(false);
-    expect(canScheduleLiveAudio({ isSynced: true, contextState: "running", playHere: false })).toBe(false);
-    expect(canScheduleLiveAudio({ isSynced: true, contextState: "running", playHere: true })).toBe(true);
+    expect(canScheduleLiveAudio({ ...ready, isSynced: false })).toBe(false);
+    expect(canScheduleLiveAudio({ ...ready, contextState: "suspended" })).toBe(false);
+    expect(canScheduleLiveAudio({ ...ready, contextState: "interrupted" })).toBe(false);
+    expect(canScheduleLiveAudio({ ...ready, playHere: false })).toBe(false);
+    expect(canScheduleLiveAudio(ready)).toBe(true);
+  });
+
+  it("stays silent behind the Start screen even when the context runs", () => {
+    expect(canScheduleLiveAudio({ ...ready, isInitingSystem: true })).toBe(false);
   });
 });

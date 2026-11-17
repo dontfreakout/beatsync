@@ -27,6 +27,12 @@ export function computeBlockIdealStartSec(p: {
   return p.nowCtxSec + delayUntilEndMs / 1000 - p.blockFrames / p.sampleRate;
 }
 
-export function canScheduleLiveAudio(p: { isSynced: boolean; contextState: string; playHere: boolean }): boolean {
-  return p.isSynced && p.contextState === "running" && p.playHere;
+/** Same gate as file playback (schedulePlay): no audio while the Start screen shows (isInitingSystem). */
+export function canScheduleLiveAudio(p: {
+  isSynced: boolean;
+  isInitingSystem: boolean;
+  contextState: string;
+  playHere: boolean;
+}): boolean {
+  return p.isSynced && !p.isInitingSystem && p.contextState === "running" && p.playHere;
 }

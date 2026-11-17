@@ -162,9 +162,10 @@ class LiveStreamPlayer {
     const captureServerTimeMs = session.captureTimes.get(block.sequence);
     if (captureServerTimeMs === undefined || block.frames === 0 || block.channelData.length === 0) return;
 
-    const { isSynced, offsetEstimate, nudgeOffsetMs } = useGlobalStore.getState();
+    const { isSynced, isInitingSystem, offsetEstimate, nudgeOffsetMs } = useGlobalStore.getState();
     const contextState = audioContextManager.getState() ?? "none";
-    if (!canScheduleLiveAudio({ isSynced, contextState, playHere: useLiveStreamStore.getState().playHere })) {
+    const playHere = useLiveStreamStore.getState().playHere;
+    if (!canScheduleLiveAudio({ isSynced, isInitingSystem, contextState, playHere })) {
       // Queued audio is mistimed after e.g. a suspension: the next chain starts with nothing queued
       this.stopNodes(session);
       session.scheduler.reset();

@@ -549,10 +549,13 @@ export const useGlobalStore = create<GlobalState>((set, get) => {
     });
   };
 
-  /** Stop playback and reset to "Start System" if audio is actively playing. */
+  /** Stop playback and reset to "Start System" if audio is actively playing (a file or the live stream). */
   const stopAndResetIfPlaying = (reason: string) => {
     const currentState = get();
-    if (!currentState.isPlaying || !currentState.audioPlayer) return;
+    // The queue is paused during a live stream, so isPlaying alone misses live audio
+    const { stream, playHere } = useLiveStreamStore.getState();
+    const isLivePlaying = stream !== null && playHere;
+    if (!(currentState.isPlaying || isLivePlaying) || !currentState.audioPlayer) return;
     try {
       currentState.audioPlayer.sourceNode.stop();
     } catch {
