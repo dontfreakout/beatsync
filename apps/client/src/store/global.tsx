@@ -37,6 +37,7 @@ import {
 } from "@beatsync/shared";
 import { Mutex } from "async-mutex";
 import { toast } from "sonner";
+import { useLiveStreamStore } from "@/store/liveStream";
 import { create } from "zustand";
 
 export const MAX_NTP_MEASUREMENTS = NTP_CONSTANTS.MAX_MEASUREMENTS;
@@ -908,6 +909,8 @@ export const useGlobalStore = create<GlobalState>((set, get) => {
 
     // if trackTimeSeconds is not provided, use the current track position
     broadcastPlay: (trackTimeSeconds?: number) => {
+      // Queue playback must not start while a live stream is active
+      if (useLiveStreamStore.getState().stream) return;
       const state = get();
       const { socket } = getSocket(state);
 
