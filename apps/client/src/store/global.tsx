@@ -7,6 +7,7 @@ import { getApiUrl } from "@/lib/urls";
 import { extractFileNameFromUrl } from "@/lib/utils";
 import {
   calculateOffsetEstimate,
+  calculateLocalDelayMs,
   calculateWaitTimeMilliseconds,
   getProbeStats,
   NTPMeasurement,
@@ -341,10 +342,14 @@ export const getFilteredOutputLatencyMs = (): number => {
 };
 
 const getWaitTimeSeconds = (state: GlobalState, targetServerTime: number) => {
-  const effectiveOffset = state.offsetEstimate + state.nudgeOffsetMs;
-  const waitTimeMilliseconds = calculateWaitTimeMilliseconds(targetServerTime, effectiveOffset);
-  const outputLatencyMs = getFilteredOutputLatencyMs();
-  return Math.max(0, (waitTimeMilliseconds - outputLatencyMs) / 1000);
+  const delayMs = calculateLocalDelayMs({
+    targetServerTimeMs: targetServerTime,
+    nowEpochMs: epochNow(),
+    offsetEstimateMs: state.offsetEstimate,
+    nudgeMs: state.nudgeOffsetMs,
+    outputLatencyMs: getFilteredOutputLatencyMs(),
+  });
+  return Math.max(0, delayMs) / 1000;
 };
 
 const resolveAudioUrl = (url: string): string => (url.startsWith("/") ? `${getApiUrl()}${url}` : url);

@@ -185,6 +185,18 @@ export const calculateWaitTimeMilliseconds = (targetServerTime: number, clockOff
 };
 
 /**
+ * Local delay until a server timestamp is due, using the file-playback rule:
+ * target - (now + offset + nudge) - outputLatency. Unclamped: negative means already late.
+ */
+export const calculateLocalDelayMs = (p: {
+  targetServerTimeMs: number;
+  nowEpochMs: number;
+  offsetEstimateMs: number;
+  nudgeMs: number;
+  outputLatencyMs: number;
+}): number => p.targetServerTimeMs - (p.nowEpochMs + p.offsetEstimateMs + p.nudgeMs) - p.outputLatencyMs;
+
+/**
  * Process an NTP_RESPONSE into a measurement and attempt to complete a probe pair.
  * Returns a ProbePairResult if both probes in the pair have been received and validated,
  * or null if still waiting for the second probe or the pair was impure.
