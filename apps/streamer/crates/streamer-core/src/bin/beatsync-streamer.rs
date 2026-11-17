@@ -2,7 +2,8 @@
 //!
 //! Flags override the saved settings and are saved. Prints one status line per change.
 //! SIGINT/SIGTERM stop the stream, restore the routing and exit 0; a second signal exits
-//! at once (PipeWire then removes the sink and WirePlumber moves the streams back).
+//! the process at once with 130/143 (PipeWire then removes the sink and WirePlumber moves the
+//! streams back).
 
 use std::fmt::Write as _;
 use std::process::ExitCode;
@@ -216,11 +217,15 @@ async fn stream(settings: Settings, backend: Arc<dyn AudioBackend>) -> ExitCode 
         }
     }
     eprintln!("beatsync-streamer: stopping (press Ctrl-C again to exit at once)");
-    tokio::select! {
-        _ = handle.shutdown() => ExitCode::SUCCESS,
-        _ = sigint.recv() => ExitCode::from(130),
-        _ = sigterm.recv() => ExitCode::from(143),
-    }
+    let code = tokio::select! {
+        _ = handle.shutdown() => return ExitCode::SUCCESS,
+        _ = sigint.recv() => 130,
+        _ = sigterm.recv() => 143,
+    };
+    // Not a return from `main`: dropping the runtime waits for blocking backend calls, and a
+    // hung `stop` would then keep the process alive.
+    eprintln!("beatsync-streamer: exiting without restoring the routing");
+    std::process::exit(code);
 }
 
 /// E.g. `connected synced rtt=24ms listeners=3 phase=streaming(7)`.

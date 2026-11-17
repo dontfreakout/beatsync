@@ -40,8 +40,9 @@ const MONO_EPOCH_INTERVAL: Duration = Duration::from_secs(5);
 const OUTGOING_CAPACITY: usize = 1024;
 /// Encoded blocks on their way from the worker to the engine.
 const BLOCKS_CAPACITY: usize = 256;
-/// 64 chunks of up to 1024 frames: over 0.5 s of capture.
-const CAPTURE_RING: usize = 64;
+/// A chunk is one graph quantum (split only above 1024 frames), so the ring is sized for the
+/// smallest quantum: 384 chunks hold 0.5 s even at 64 frames per chunk (about 3 MB).
+const CAPTURE_RING: usize = 384;
 /// 512 blocks of 20 ms: the largest delay (5 s) plus 1 s, with room to spare.
 const PLAYOUT_RING: usize = 512;
 const TIMELINE_ALPHA: f64 = 0.002;
