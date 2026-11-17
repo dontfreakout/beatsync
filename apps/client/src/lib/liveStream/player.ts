@@ -16,6 +16,13 @@ const OUTPUT_LATENCY_REFRESH_MS = 500;
 /** A block that starts this much before the end of the queued audio would double it */
 const OVERLAP_EPSILON_SEC = 0.001;
 
+interface QueuedNode {
+  node: AudioBufferSourceNode;
+  startSec: number;
+  /** AudioContext time at which the node stops sounding */
+  endSec: number;
+}
+
 interface Session {
   stream: LiveStreamType;
   decoder: OpusDecoderHandle | null;
@@ -23,7 +30,7 @@ interface Session {
   monitor: LateFrameMonitor;
   /** sequence → captureServerTimeMs, in arrival order */
   captureTimes: Map<number, number>;
-  nodes: Set<AudioBufferSourceNode>;
+  nodes: Set<QueuedNode>;
   /** AudioContext time at which the last scheduled node ends */
   queuedEndSec: number;
   lastFrameAt: number;
@@ -158,6 +165,8 @@ class LiveStreamPlayer {
     const { isSynced, offsetEstimate, nudgeOffsetMs } = useGlobalStore.getState();
     const contextState = audioContextManager.getState() ?? "none";
     if (!canScheduleLiveAudio({ isSynced, contextState, playHere: useLiveStreamStore.getState().playHere })) {
+      // Queued audio is mistimed after e.g. a suspension: the next chain starts with nothing queued
+      this.stopNodes(session);
       session.scheduler.reset();
       return;
     }
@@ -186,7 +195,7 @@ class LiveStreamPlayer {
     }
 
     // A scheduler restart can move the chain earlier while old audio is still queued
-    if (decision.startSec < session.queuedEndSec - OVERLAP_EPSILON_SEC) this.stopNodes(session);
+    if (decision.startSec < session.queuedEndSec - OVERLAP_EPSILON_SEC) this.cutNodesAt(session, decision.startSec);
 
     const buffer = ctx.createBuffer(block.channelData.length, block.frames, SAMPLE_RATE);
     block.channelData.forEach((data, c) => buffer.getChannelData(c).set(data));
@@ -194,23 +203,37 @@ class LiveStreamPlayer {
     node.buffer = buffer;
     node.playbackRate.value = decision.playbackRate;
     node.connect(audioContextManager.getInputNode());
+    const queued: QueuedNode = {
+      node,
+      startSec: decision.startSec,
+      endSec: decision.startSec + durationSec / decision.playbackRate,
+    };
     node.onended = () => {
-      session.nodes.delete(node);
+      session.nodes.delete(queued);
       node.disconnect();
     };
-    node.start(decision.startSec);
-    session.nodes.add(node);
-    session.queuedEndSec = decision.startSec + durationSec / decision.playbackRate;
+    node.start(queued.startSec);
+    session.nodes.add(queued);
+    session.queuedEndSec = queued.endSec;
     this.stats.played++;
   }
 
-  private stopNodes(session: Session): void {
-    for (const node of session.nodes) {
-      node.onended = null;
-      node.stop();
-      node.disconnect();
+  /** Silences queued audio from atSec on, so the new chain follows the old one with no gap or overlap. */
+  private cutNodesAt(session: Session, atSec: number): void {
+    for (const queued of session.nodes) {
+      if (queued.startSec >= atSec) {
+        // Not started yet (atSec is in the future): it never sounds
+        discardNode(session, queued);
+      } else if (queued.endSec > atSec) {
+        // A later stop() call replaces this one, so endSec tracks it to keep later cuts correct
+        queued.node.stop(atSec);
+        queued.endSec = atSec;
+      }
     }
-    session.nodes.clear();
+  }
+
+  private stopNodes(session: Session): void {
+    for (const queued of session.nodes) discardNode(session, queued);
     session.queuedEndSec = 0;
   }
 
@@ -230,6 +253,13 @@ class LiveStreamPlayer {
     }
     return this.outputLatencyMs;
   }
+}
+
+function discardNode(session: Session, queued: QueuedNode): void {
+  queued.node.onended = null;
+  queued.node.stop();
+  queued.node.disconnect();
+  session.nodes.delete(queued);
 }
 
 function setStatus(next: { status: LiveStreamStatus; isTooSlow: boolean }): void {
