@@ -41,9 +41,23 @@ async function isWebCodecsOpusSupported(channels: number): Promise<boolean> {
   }
 }
 
-function createWebCodecsDecoder(o: CreateOpusDecoderOptions): OpusDecoderHandle {
-  const decoder = new AudioDecoder({
+/** The WebCodecs classes the decoder needs; tests pass fakes because happy-dom has no WebCodecs */
+export interface WebCodecsAudioApi {
+  AudioDecoder: new (init: AudioDecoderInit) => Pick<AudioDecoder, "state" | "configure" | "decode" | "close">;
+  EncodedAudioChunk: new (init: EncodedAudioChunkInit) => EncodedAudioChunk;
+}
+
+export function createWebCodecsDecoder(
+  o: CreateOpusDecoderOptions,
+  api: WebCodecsAudioApi = { AudioDecoder, EncodedAudioChunk }
+): OpusDecoderHandle {
+  // Sequences of the chunks inside the decoder, oldest first. Opus gives one output per chunk,
+  // in decode order. The output timestamp cannot identify the chunk: Chromium stamps outputs
+  // from the first input timestamp plus the frames decoded, so an input gap does not show.
+  const pendingSequences: number[] = [];
+  const decoder = new api.AudioDecoder({
     output: (audioData) => {
+      const sequence = pendingSequences.shift() ?? Math.round(audioData.timestamp / FRAME_DURATION_US);
       try {
         const channelData: Float32Array[] = [];
         for (let c = 0; c < audioData.numberOfChannels; c++) {
@@ -51,17 +65,15 @@ function createWebCodecsDecoder(o: CreateOpusDecoderOptions): OpusDecoderHandle 
           audioData.copyTo(plane, { planeIndex: c, format: "f32-planar" });
           channelData.push(plane);
         }
-        o.onBlock({
-          // The decoder carries the chunk timestamp through, so it maps back to the sequence
-          sequence: Math.round(audioData.timestamp / FRAME_DURATION_US),
-          frames: audioData.numberOfFrames,
-          channelData,
-        });
+        o.onBlock({ sequence, frames: audioData.numberOfFrames, channelData });
       } finally {
         audioData.close();
       }
     },
-    error: (e) => o.onError(e),
+    error: (e) => {
+      pendingSequences.length = 0;
+      o.onError(e);
+    },
   });
   decoder.configure({ codec: "opus", sampleRate: SAMPLE_RATE, numberOfChannels: o.channels });
 
@@ -69,9 +81,12 @@ function createWebCodecsDecoder(o: CreateOpusDecoderOptions): OpusDecoderHandle 
     kind: "webcodecs",
     decode(sequence, packet) {
       if (decoder.state !== "configured") return;
-      decoder.decode(new EncodedAudioChunk({ type: "key", timestamp: sequence * FRAME_DURATION_US, data: packet }));
+      const chunk = new api.EncodedAudioChunk({ type: "key", timestamp: sequence * FRAME_DURATION_US, data: packet });
+      pendingSequences.push(sequence);
+      decoder.decode(chunk);
     },
     close() {
+      pendingSequences.length = 0;
       if (decoder.state !== "closed") decoder.close();
     },
   };
