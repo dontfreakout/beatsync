@@ -59,13 +59,13 @@ pub struct FillStats {
 
 #[derive(Debug, Clone, Copy)]
 enum Cursor {
-    /// No position: the next `fill` places the cursor at the output time.
+    /// No position (start, after `reset`, or after an underrun): the next block found is placed
+    /// at the output time (resync).
     Unset,
+    /// Placed before the head block, which starts in the future: silence until its start.
+    Waiting,
     /// At frame `index` of the source's head block.
     Block { index: usize },
-    /// Between blocks (underrun, or waiting for a future block). The cursor time is the output
-    /// time, so a block that is still in the future starts exactly at its target.
-    Gap,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,8 +78,9 @@ enum Correction {
 }
 
 /// Plays [`PcmBlock`]s back to back from a cursor (head block + frame index) and keeps the
-/// cursor at the time the output is heard: small errors are corrected gradually, large errors
-/// resync. Real-time safe: `fill` does not allocate, lock or panic.
+/// cursor at the time the output is heard: small errors are corrected gradually; large errors,
+/// timestamp jumps between blocks and the end of an underrun resync. Real-time safe: `fill` does
+/// not allocate, lock or panic.
 pub struct Playout {
     frame_ms: f64,
     resync_ms: f64,
@@ -118,7 +119,7 @@ impl Playout {
         let (out, tail) = out.split_at_mut(frames * CHANNELS);
         tail.fill(0.0);
         let (pos, correction) = self.align(out, heard_at_server_ms, src, &mut stats);
-        self.play(out, pos, correction, src, &mut stats);
+        self.play(out, heard_at_server_ms, pos, correction, src, &mut stats);
         stats
     }
 
@@ -147,22 +148,25 @@ impl Playout {
         self.last_error_ms = None;
         let index = match self.cursor {
             Cursor::Unset => {
-                stats.resynced = true;
-                return (self.place(out, heard_at, src, stats), Correction::None);
+                if src.peek().is_none() {
+                    return (silence(out, 0, stats), Correction::None);
+                }
+                return (self.resync(out, heard_at, src, stats), Correction::None);
             }
-            Cursor::Block { index } => index,
-            Cursor::Gap => {
+            Cursor::Waiting => {
                 let Some(head) = src.peek() else {
+                    self.cursor = Cursor::Unset;
                     return (silence(out, 0, stats), Correction::None);
                 };
                 let lead = ((head.target_start_server_ms - heard_at) / self.frame_ms).round();
                 if lead > 0.0 {
                     return (self.wait(out, lead, stats), Correction::None);
                 }
-                // The block is due or late: the normal error check decides.
+                // The block is due: check it like a playing cursor.
                 self.cursor = Cursor::Block { index: 0 };
                 0
             }
+            Cursor::Block { index } => index,
         };
         let Some(head) = src.peek() else {
             return (0, Correction::None);
@@ -170,8 +174,7 @@ impl Playout {
         let error = heard_at - (head.target_start_server_ms + index as f64 * self.frame_ms);
         self.last_error_ms = Some(error);
         if error.abs() > self.resync_ms {
-            stats.resynced = true;
-            (self.place(out, heard_at, src, stats), Correction::None)
+            (self.resync(out, heard_at, src, stats), Correction::None)
         } else if error > self.threshold_ms {
             (0, Correction::Skip)
         } else if error < -self.threshold_ms {
@@ -181,19 +184,20 @@ impl Playout {
         }
     }
 
-    /// Resync: drops blocks that end before the output time and puts the cursor at the output
-    /// time, mid-block or after leading silence. Returns the first output frame to play.
-    fn place(
+    /// Drops blocks that end before `heard_at` (the time of `out[0]`) and puts the cursor at
+    /// `heard_at`, mid-block or after leading silence. Returns the first output frame to play.
+    fn resync(
         &mut self,
         out: &mut [f32],
         heard_at: f64,
         src: &mut impl BlockSource,
         stats: &mut FillStats,
     ) -> usize {
+        stats.resynced = true;
         self.until_correction = self.interval;
         loop {
             let Some(head) = src.peek() else {
-                self.cursor = Cursor::Gap;
+                self.cursor = Cursor::Unset;
                 return silence(out, 0, stats);
             };
             let offset = ((heard_at - head.target_start_server_ms) / self.frame_ms).round();
@@ -216,7 +220,7 @@ impl Playout {
     fn wait(&mut self, out: &mut [f32], lead: f64, stats: &mut FillStats) -> usize {
         let frames = out.len() / CHANNELS;
         if lead >= frames as f64 {
-            self.cursor = Cursor::Gap;
+            self.cursor = Cursor::Waiting;
             return silence(out, 0, stats);
         }
         let lead = lead as usize;
@@ -226,12 +230,15 @@ impl Playout {
     }
 
     /// Plays the cursor back to back into output frames `pos..`, with one skip or repeat per
-    /// `interval` frames if correcting. Pops each block after its last frame.
+    /// `interval` frames if correcting. Pops each block after its last frame. A next block that
+    /// starts more than `resync_ms` away from the end of the previous one (capture re-anchor)
+    /// resyncs at once, so it is never heard early.
     fn play(
         &mut self,
         out: &mut [f32],
+        heard_at: f64,
         mut pos: usize,
-        correction: Correction,
+        mut correction: Correction,
         src: &mut impl BlockSource,
         stats: &mut FillStats,
     ) {
@@ -241,10 +248,12 @@ impl Playout {
         let frames = out.len() / CHANNELS;
         while pos < frames {
             let Some(block) = src.peek() else {
+                // Underrun: the next block found resyncs.
                 silence(out, pos, stats);
-                self.cursor = Cursor::Gap;
+                self.cursor = Cursor::Unset;
                 return;
             };
+            let end_ms = block.target_start_server_ms + FRAME_SAMPLES as f64 * self.frame_ms;
             let mut run = (frames - pos).min(FRAME_SAMPLES - index);
             if correction != Correction::None {
                 run = run.min(self.until_correction);
@@ -264,9 +273,21 @@ impl Playout {
                     }
                 }
             }
-            if index >= FRAME_SAMPLES {
-                index -= FRAME_SAMPLES;
-                src.pop();
+            if index < FRAME_SAMPLES {
+                continue;
+            }
+            index -= FRAME_SAMPLES;
+            src.pop();
+            if let Some(next) = src.peek()
+                && (next.target_start_server_ms - end_ms).abs() > self.resync_ms
+            {
+                correction = Correction::None;
+                let at = heard_at + pos as f64 * self.frame_ms;
+                pos += self.resync(&mut out[pos * CHANNELS..], at, src, stats);
+                let Cursor::Block { index: placed } = self.cursor else {
+                    return;
+                };
+                index = placed;
             }
         }
         self.cursor = Cursor::Block { index };
@@ -442,25 +463,80 @@ mod tests {
 
     #[test]
     fn large_error_resyncs() {
-        // A capture re-anchor: from block 5 on, the targets are 100 ms later. Block 5 plays back
-        // to back first (early), then the next call resyncs to its target, T0 + 200 ms.
+        // From call 5 on, the output time is 100 ms (4800 frames) later: the cursor is 100 ms
+        // late, so blocks 5..10 (ending before the new output time) are dropped and the cursor
+        // joins block 10 mid-block, at the output time.
+        const FRAMES: usize = 1024;
+        let mut p = playout();
+        let mut src = contiguous(0..20);
+        let mut out = buf(FRAMES);
+        for call in 0..7 {
+            let frame = call * FRAMES + if call >= 5 { 4800 } else { 0 };
+            let stats = p.fill(&mut out, T0 + frame as f64 * FRAME_MS, &mut src);
+            assert_eq!(stats.resynced, call == 0 || call == 5, "call {call}");
+            let dropped = if call == 5 { 5 } else { 0 };
+            assert_eq!(stats.dropped_blocks, dropped, "call {call}");
+            assert_eq!(source_frame(&out, 0), Some(frame as u64), "call {call}");
+        }
+        let error = p.last_error_ms().expect("cursor on a block");
+        assert!(error.abs() < FRAME_MS / 2.0, "error {error} ms");
+    }
+
+    #[test]
+    fn forward_jump_between_blocks_waits_for_target() {
+        // A capture re-anchor: from block 5 on, the targets are 100 ms later. Block 4 ends at
+        // output frame 4800, inside call 4; block 5 must wait for its target, T0 + 200 ms =
+        // output frame 9600, and must not play early, not even until the end of call 4.
         const FRAMES: usize = 1024;
         let mut p = playout();
         let jump = |n: u64| if n >= 5 { 100.0 } else { 0.0 };
         let blocks = (0..12).map(|n| block(n, T0 + 20.0 * n as f64 + jump(n)));
         let mut src = Queue(blocks.collect());
         let check = |call: usize, s: FillStats, p: &Playout| {
-            assert_eq!(s.resynced, call == 0 || call == 5, "call {call}");
+            assert_eq!(s.resynced, call == 0 || call == 4, "call {call}");
             if call == 10 {
                 let error = p.last_error_ms().expect("cursor on a block");
-                assert!(error.abs() < FRAME_MS / 2.0, "error {error} ms after resync");
+                assert!(error.abs() < FRAME_MS / 2.0, "error {error} ms");
             }
         };
         let played = run(&mut p, &mut src, FRAMES, 11, |_, _| {}, check);
-        assert_eq!(played[4800], Some(5 * 960), "block 5 starts back to back");
-        assert!(played[5120..9600].iter().all(Option::is_none));
-        assert_eq!(played[9600], Some(5 * 960), "block 5 replays at its target");
-        assert_eq!(played[9700], Some(5 * 960 + 100));
+        for (k, &f) in played.iter().enumerate() {
+            let want = match k {
+                ..4800 => Some(k as u64),
+                4800..9600 => None,
+                _ => Some(k as u64 - 4800),
+            };
+            assert_eq!(f, want, "output frame {k}");
+        }
+    }
+
+    #[test]
+    fn block_after_underrun_is_aligned_exactly() {
+        // Blocks 0..3 cover output frames 0..2880, so call 2 runs dry 192 frames before its end.
+        // Block 3 (due at 2880) arrives before call 3, 4 ms late: the cursor joins it at the
+        // output time (frame 192) instead of starting it late and correcting gradually.
+        const FRAMES: usize = 1024;
+        let mut p = playout();
+        let mut src = contiguous(0..3);
+        let feed = |call: usize, src: &mut Queue| {
+            if call == 3 {
+                for n in 3..8 {
+                    src.0.push_back(block(n, T0 + 20.0 * n as f64));
+                }
+            }
+        };
+        let check = |call: usize, s: FillStats, p: &Playout| {
+            assert_eq!(s.resynced, call == 0 || call == 3, "call {call}");
+            if call == 4 {
+                let error = p.last_error_ms().expect("cursor on a block");
+                assert!(error.abs() < FRAME_MS / 2.0, "error {error} ms");
+            }
+        };
+        let played = run(&mut p, &mut src, FRAMES, 5, feed, check);
+        for (k, &f) in played.iter().enumerate() {
+            let want = if (2880..3072).contains(&k) { None } else { Some(k as u64) };
+            assert_eq!(f, want, "output frame {k}");
+        }
     }
 
     #[test]
@@ -479,7 +555,8 @@ mod tests {
             }
         };
         let check = |call: usize, s: FillStats, _: &Playout| {
-            assert_eq!(s.resynced, call == 0, "call {call}");
+            // Call 6 finds block 8 after the underrun and resyncs to wait for its target.
+            assert_eq!(s.resynced, call == 0 || call == 6, "call {call}");
             silent += s.silent_frames;
         };
         let played = run(&mut p, &mut src, FRAMES, 10, feed, check);
