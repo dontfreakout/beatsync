@@ -188,4 +188,14 @@ describe("Live stream lifecycle", () => {
     if (msg?.type !== "ROOM_EVENT" || msg.event.type !== "LIVE_STREAM_STATE") throw new Error("missing state");
     expect(msg.event.stream?.streamId).toBe(id);
   });
+
+  it("a client that joins with no active stream receives LIVE_STREAM_STATE with stream: null", () => {
+    const ws2 = createMockWs({ clientId: "late", roomId: ROOM_ID });
+    handleOpen(ws2, server);
+    const msg = toClient.find(
+      (m) => m.clientId === "late" && m.message.type === "ROOM_EVENT" && m.message.event.type === "LIVE_STREAM_STATE"
+    )?.message;
+    if (msg?.type !== "ROOM_EVENT" || msg.event.type !== "LIVE_STREAM_STATE") throw new Error("missing state");
+    expect(msg.event.stream).toBeNull();
+  });
 });
