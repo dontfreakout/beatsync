@@ -1,5 +1,5 @@
-import { describe, expect, it } from "bun:test";
-import { createWebCodecsDecoder, type WebCodecsAudioApi } from "../decoder";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { createOpusDecoder, createWebCodecsDecoder, type WebCodecsAudioApi } from "../decoder";
 
 const FRAME_DURATION_US = 20_000;
 
@@ -68,5 +68,35 @@ describe("createWebCodecsDecoder", () => {
     for (const sequence of [100, 101, 102, 105, 106]) handle.decode(sequence, new Uint8Array([1]));
     FakeAudioDecoder.last!.emitOutputs();
     expect(sequences).toEqual([100, 101, 102, 105, 106]);
+  });
+});
+
+describe("createOpusDecoder", () => {
+  /** A browser whose WebCodecs claims Opus support (it may still fail at configure or decode time) */
+  class OpusClaimingAudioDecoder extends FakeAudioDecoder {
+    static isConfigSupported(): Promise<{ supported: boolean }> {
+      return Promise.resolve({ supported: true });
+    }
+  }
+
+  beforeEach(() => {
+    Object.assign(globalThis, { AudioDecoder: OpusClaimingAudioDecoder, EncodedAudioChunk: FakeEncodedAudioChunk });
+  });
+
+  afterEach(() => {
+    const g = globalThis as { AudioDecoder?: unknown; EncodedAudioChunk?: unknown };
+    delete g.AudioDecoder;
+    delete g.EncodedAudioChunk;
+  });
+
+  it("forceWasm opens the WASM decoder even when WebCodecs claims Opus support", async () => {
+    const options = { channels: 2 as const, onBlock: () => {}, onError: () => {} };
+    const preferred = await createOpusDecoder(options);
+    expect(preferred.kind).toBe("webcodecs");
+    preferred.close();
+
+    const forced = await createOpusDecoder({ ...options, forceWasm: true });
+    expect(forced.kind).toBe("wasm");
+    forced.close();
   });
 });

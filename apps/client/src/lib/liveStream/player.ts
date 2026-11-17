@@ -11,6 +11,8 @@ const CAPTURE_TIME_RETENTION_MS = 5000;
 const STATUS_INTERVAL_MS = 500;
 const WAITING_GRACE_MS = 1000;
 const DECODER_RETRY_MS = 1000;
+/** WebCodecs can claim Opus support and still fail at configure or decode time */
+const DECODER_FAILURES_BEFORE_WASM = 2;
 /** getFilteredOutputLatencyMs warns on every call for Bluetooth outputs, so it is not read per block */
 const OUTPUT_LATENCY_REFRESH_MS = 500;
 /** A block that starts this much before the end of the queued audio would double it */
@@ -36,6 +38,8 @@ interface Session {
   lastFrameAt: number;
   statusTimer: ReturnType<typeof setInterval>;
   retryTimer: ReturnType<typeof setTimeout> | null;
+  /** From DECODER_FAILURES_BEFORE_WASM on, the session uses the WASM decoder */
+  decoderFailures: number;
 }
 
 export interface LiveStreamStats {
@@ -103,6 +107,7 @@ class LiveStreamPlayer {
       lastFrameAt: 0,
       statusTimer: setInterval(() => this.updateStatus(session), STATUS_INTERVAL_MS),
       retryTimer: null,
+      decoderFailures: 0,
     };
     this.session = session;
     this.stats = { received: 0, decoded: 0, played: 0, droppedLate: 0, droppedStale: 0 };
@@ -130,6 +135,7 @@ class LiveStreamPlayer {
     try {
       decoder = await createOpusDecoder({
         channels: session.stream.channels,
+        forceWasm: session.decoderFailures >= DECODER_FAILURES_BEFORE_WASM,
         onBlock: (block) => {
           if (this.session === session) this.handleBlock(session, block);
         },
@@ -148,7 +154,10 @@ class LiveStreamPlayer {
 
   private handleDecoderError(session: Session, error: Error): void {
     if (this.session !== session || session.retryTimer) return;
-    console.error(`[LiveStream] Decoder failed, retrying in ${DECODER_RETRY_MS} ms`, error);
+    // Counts every failure: without WebCodecs Opus support the decoder is WASM already, so the switch changes nothing
+    session.decoderFailures++;
+    const next = session.decoderFailures >= DECODER_FAILURES_BEFORE_WASM ? " with the WASM decoder" : "";
+    console.error(`[LiveStream] Decoder failed, retrying${next} in ${DECODER_RETRY_MS} ms`, error);
     session.decoder?.close();
     session.decoder = null;
     session.retryTimer = setTimeout(() => {

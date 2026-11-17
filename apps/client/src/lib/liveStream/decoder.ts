@@ -17,13 +17,15 @@ export interface OpusDecoderHandle {
 
 interface CreateOpusDecoderOptions {
   channels: 1 | 2;
+  /** Skip WebCodecs, e.g. after it claimed Opus support but failed at configure or decode time */
+  forceWasm?: boolean;
   onBlock: (block: DecodedBlock) => void;
   onError: (error: Error) => void;
 }
 
-/** Opus decoder for live frames: WebCodecs when the browser supports Opus, else the WASM fallback. */
+/** Opus decoder for live frames: WebCodecs when the browser supports Opus and forceWasm is off, else WASM. */
 export async function createOpusDecoder(o: CreateOpusDecoderOptions): Promise<OpusDecoderHandle> {
-  if (await isWebCodecsOpusSupported(o.channels)) return createWebCodecsDecoder(o);
+  if (!o.forceWasm && (await isWebCodecsOpusSupported(o.channels))) return createWebCodecsDecoder(o);
   return createWasmDecoder(o);
 }
 
