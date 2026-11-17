@@ -1,5 +1,6 @@
 pub mod clock;
 pub mod encoder;
+pub mod engine;
 pub mod frame;
 pub mod gain;
 pub mod ntp;
