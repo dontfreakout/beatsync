@@ -81,6 +81,12 @@ pub fn build_ws_url(
 }
 
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// No message from the server for this long ends the session. While connected the engine
+/// sends a probe pair at least every 2.5 s and the server answers each, so 10 s of silence
+/// means a dead socket (e.g. after a network change) that would stay open for minutes.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+/// A connect (TCP, TLS and WebSocket handshake) that takes longer is a failed attempt.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 const BACKOFF_SECS: [u64; 5] = [1, 2, 4, 8, 10];
 
@@ -140,6 +146,8 @@ async fn session(
 ) -> SessionEnd {
     let (mut write, mut read) = ws.split();
     let mut pending: Option<PendingProbe> = None;
+    let idle = tokio::time::sleep(IDLE_TIMEOUT);
+    tokio::pin!(idle);
     loop {
         let probe_wait = async {
             match &pending {
@@ -152,6 +160,13 @@ async fn session(
             _ = wait_shutdown(shutdown) => {
                 let _ = tokio::time::timeout(CLOSE_TIMEOUT, write.send(Message::Close(None))).await;
                 return SessionEnd::Shutdown;
+            }
+            _ = &mut idle => {
+                eprintln!(
+                    "streamer: no message from the server for {} s, reconnecting",
+                    IDLE_TIMEOUT.as_secs()
+                );
+                return SessionEnd::Lost;
             }
             _ = probe_wait => {
                 if let Some(p) = pending.take() {
@@ -174,31 +189,36 @@ async fn session(
                     });
                 }
             },
-            incoming = read.next() => match incoming {
-                Some(Ok(Message::Text(text))) => {
-                    let t3 = epoch_ms();
-                    match serde_json::from_str::<ServerMessage>(text.as_str()) {
-                        Ok(ServerMessage::NtpResponse { t0, t1, t2, probe_group_id, probe_group_index }) => {
-                            let ev = ConnEvent::NtpResponse {
-                                t0, t1, t2, t3,
-                                group_id: probe_group_id,
-                                index: probe_group_index,
-                            };
-                            if ev_tx.send(ev).is_err() {
-                                return SessionEnd::Stop;
-                            }
-                        }
-                        Ok(m) => {
-                            if ev_tx.send(ConnEvent::Message(m)).is_err() {
-                                return SessionEnd::Stop;
-                            }
-                        }
-                        Err(e) => eprintln!("streamer: cannot parse server message: {e}"),
-                    }
+            incoming = read.next() => {
+                if matches!(incoming, Some(Ok(_))) {
+                    idle.as_mut().reset(Instant::now() + IDLE_TIMEOUT);
                 }
-                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return SessionEnd::Lost,
-                Some(Ok(_)) => {}
-            },
+                match incoming {
+                    Some(Ok(Message::Text(text))) => {
+                        let t3 = epoch_ms();
+                        match serde_json::from_str::<ServerMessage>(text.as_str()) {
+                            Ok(ServerMessage::NtpResponse { t0, t1, t2, probe_group_id, probe_group_index }) => {
+                                let ev = ConnEvent::NtpResponse {
+                                    t0, t1, t2, t3,
+                                    group_id: probe_group_id,
+                                    index: probe_group_index,
+                                };
+                                if ev_tx.send(ev).is_err() {
+                                    return SessionEnd::Stop;
+                                }
+                            }
+                            Ok(m) => {
+                                if ev_tx.send(ConnEvent::Message(m)).is_err() {
+                                    return SessionEnd::Stop;
+                                }
+                            }
+                            Err(e) => eprintln!("streamer: cannot parse server message: {e}"),
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return SessionEnd::Lost,
+                    Some(Ok(_)) => {}
+                }
+            }
         }
         for m in to_send {
             tokio::select! {
@@ -229,7 +249,10 @@ pub async fn run_connection(
         if *shutdown.borrow() {
             return;
         }
-        let connect = tokio_tungstenite::connect_async_with_config(url.as_str(), None, true);
+        let connect = tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            tokio_tungstenite::connect_async_with_config(url.as_str(), None, true),
+        );
         tokio::pin!(connect);
         let result = loop {
             tokio::select! {
@@ -239,7 +262,7 @@ pub async fn run_connection(
             }
         };
         match result {
-            Ok((ws, _)) => {
+            Ok(Ok((ws, _))) => {
                 attempt = 0;
                 if ev_tx.send(ConnEvent::Connected).is_err() {
                     return;
@@ -253,7 +276,11 @@ pub async fn run_connection(
                     }
                 }
             }
-            Err(e) => eprintln!("streamer: connect failed: {e}"),
+            Ok(Err(e)) => eprintln!("streamer: connect failed: {e}"),
+            Err(_) => eprintln!(
+                "streamer: connect timed out after {} s",
+                CONNECT_TIMEOUT.as_secs()
+            ),
         }
         let delay = Duration::from_secs(BACKOFF_SECS[attempt.min(BACKOFF_SECS.len() - 1)]);
         attempt += 1;
@@ -388,6 +415,43 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn silent_server_ends_the_session_after_10_s() {
+        // A half-open socket (Wi-Fi drop, IP change) gives no error for minutes: the status
+        // stays "synced" and a start hangs in Starting.
+        let mut h = harness().await;
+        let _ws = accept(&h.listener).await; // accepts, then never sends
+        assert!(matches!(next_ev(&mut h).await, ConnEvent::Connected));
+        let begin = Instant::now();
+        let ev = timeout(Duration::from_secs(13), h.ev_rx.recv())
+            .await
+            .expect("the session ends")
+            .unwrap();
+        assert!(matches!(ev, ConnEvent::Disconnected), "{ev:?}");
+        let silent = begin.elapsed();
+        assert!(silent >= Duration::from_millis(9_500), "after {silent:?}");
+        h.shutdown_tx.send(true).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unanswered_handshake_is_retried() {
+        let h = harness().await;
+        // The TCP connection is accepted, the WebSocket handshake never answered.
+        let (first, _) = timeout(Duration::from_secs(4), h.listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let begin = Instant::now();
+        let (second, _) = timeout(Duration::from_secs(14), h.listener.accept())
+            .await
+            .expect("a new attempt after the connect timeout and the backoff")
+            .unwrap();
+        let waited = begin.elapsed();
+        assert!(waited >= Duration::from_millis(9_500), "after {waited:?}");
+        drop((first, second));
+        h.shutdown_tx.send(true).unwrap();
     }
 
     #[tokio::test]
