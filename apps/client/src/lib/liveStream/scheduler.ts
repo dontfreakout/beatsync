@@ -99,3 +99,26 @@ export class LateFrameMonitor {
     if (i > 0) this.samples.splice(0, i);
   }
 }
+
+/**
+ * Detects a stall in frame arrival (e.g. a tab resume). The burst of old frames after a stall is not
+ * a sign of a slow connection, so arrivals inside a grace window after a gap are reported to the caller.
+ */
+export class ArrivalGapTracker {
+  private lastArrivalMs: number | null = null;
+  private graceUntilMs = -Infinity;
+
+  constructor(
+    private readonly gapMs = 200,
+    private readonly graceMs = 2000
+  ) {}
+
+  /** Records an arrival. Returns true when it falls inside the grace window that follows an arrival gap. */
+  arrive(nowMs: number): boolean {
+    if (this.lastArrivalMs !== null && nowMs - this.lastArrivalMs > this.gapMs) {
+      this.graceUntilMs = nowMs + this.graceMs;
+    }
+    this.lastArrivalMs = nowMs;
+    return nowMs <= this.graceUntilMs;
+  }
+}

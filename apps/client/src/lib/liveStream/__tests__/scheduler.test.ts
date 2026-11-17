@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { LateFrameMonitor, LiveScheduler, type LiveScheduleDecision } from "../scheduler";
+import { ArrivalGapTracker, LateFrameMonitor, LiveScheduler, type LiveScheduleDecision } from "../scheduler";
 
 const D = 0.02;
 const block = (sequence: number, idealStartSec: number, nowSec = 0) => ({
@@ -107,5 +107,25 @@ describe("LateFrameMonitor", () => {
     const m = new LateFrameMonitor();
     feed(m, 40, 10, 1000);
     expect(m.isTooSlow(1000)).toBe(false);
+  });
+});
+
+describe("ArrivalGapTracker", () => {
+  it("the first arrival opens no window", () => {
+    expect(new ArrivalGapTracker().arrive(5000)).toBe(false);
+  });
+
+  it("steady arrivals never open a grace window", () => {
+    const t = new ArrivalGapTracker();
+    for (let ms = 0; ms <= 5000; ms += 20) expect(t.arrive(ms)).toBe(false);
+  });
+
+  it("an arrival after a 500 ms gap opens a 2 s grace window", () => {
+    const t = new ArrivalGapTracker();
+    t.arrive(0);
+    t.arrive(20);
+    expect(t.arrive(520)).toBe(true);
+    for (let ms = 540; ms <= 2520; ms += 20) expect(t.arrive(ms)).toBe(true);
+    expect(t.arrive(2540)).toBe(false);
   });
 });

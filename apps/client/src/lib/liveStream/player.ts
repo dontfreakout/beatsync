@@ -1,6 +1,6 @@
 import { audioContextManager } from "@/lib/audioContextManager";
 import { createOpusDecoder, type DecodedBlock, type OpusDecoderHandle } from "@/lib/liveStream/decoder";
-import { LateFrameMonitor, LiveScheduler } from "@/lib/liveStream/scheduler";
+import { ArrivalGapTracker, LateFrameMonitor, LiveScheduler } from "@/lib/liveStream/scheduler";
 import { canScheduleLiveAudio, computeBlockIdealStartSec, isFrameExpired } from "@/lib/liveStream/timing";
 import { getFilteredOutputLatencyMs, useGlobalStore } from "@/store/global";
 import { type LiveStreamStatus, useLiveStreamStore } from "@/store/liveStream";
@@ -30,6 +30,7 @@ interface Session {
   decoder: OpusDecoderHandle | null;
   scheduler: LiveScheduler;
   monitor: LateFrameMonitor;
+  arrivals: ArrivalGapTracker;
   /** sequence → captureServerTimeMs, in arrival order */
   captureTimes: Map<number, number>;
   nodes: Set<QueuedNode>;
@@ -75,11 +76,18 @@ class LiveStreamPlayer {
     if (!frame || frame.header.streamId !== session.stream.streamId) return;
 
     const { sequence, captureServerTimeMs } = frame.header;
-    session.lastFrameAt = Date.now();
-    // Not decoded and not counted as late: a stale burst (e.g. after a tab resume) would fake "too slow"
+    const nowMs = Date.now();
+    session.lastFrameAt = nowMs;
+    const inGrace = session.arrivals.arrive(nowMs);
     const { delayMs, frameDurationMs } = session.stream;
     const nowServerMs = epochNow() + useGlobalStore.getState().offsetEstimate;
-    if (isFrameExpired({ captureServerTimeMs, delayMs, frameDurationMs, nowServerMs })) return;
+    if (isFrameExpired({ captureServerTimeMs, delayMs, frameDurationMs, nowServerMs })) {
+      // Not decoded. Counted as late, so frames that always arrive too late still raise "too slow"
+      // (updateStatus reads the monitor). Not counted right after an arrival gap: the stale burst
+      // after a stall or tab resume would fake "too slow".
+      if (!inGrace) session.monitor.record(true, nowMs);
+      return;
+    }
 
     session.captureTimes.set(sequence, captureServerTimeMs);
     for (const [seq, captureMs] of session.captureTimes) {
@@ -107,6 +115,7 @@ class LiveStreamPlayer {
       decoder: null,
       scheduler: new LiveScheduler(),
       monitor: new LateFrameMonitor(),
+      arrivals: new ArrivalGapTracker(),
       captureTimes: new Map(),
       nodes: new Set(),
       queuedEndSec: 0,
