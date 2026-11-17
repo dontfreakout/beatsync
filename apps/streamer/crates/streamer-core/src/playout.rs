@@ -463,6 +463,54 @@ mod tests {
     }
 
     #[test]
+    fn slow_output_clock_is_corrected_by_skipping() {
+        // The mirror of `drift_is_corrected_gradually`: the output clock runs 100 ppm slow, so
+        // each buffer spans a little more server time, the cursor falls late and source frames
+        // are skipped. A skip at the end of a block carries into the next block; the buffer
+        // sizes put skips on block ends.
+        for frames_per_call in [1024, 960, 250] {
+            let calls = 60 * 48_000 / frames_per_call;
+            let mut p = playout();
+            let mut src = Queue(VecDeque::new());
+            let mut next = 0;
+            let mut out = buf(frames_per_call);
+            let mut prev: Option<u64> = None;
+            let mut skips = 0;
+            for call in 0..calls {
+                while src.0.len() < 4 {
+                    src.0.push_back(block(next, T0 + 20.0 * next as f64));
+                    next += 1;
+                }
+                let heard_at = T0 + call as f64 * frames_per_call as f64 / 48.0 / (1.0 - 100e-6);
+                let stats = p.fill(&mut out, heard_at, &mut src);
+                let at = format!("{frames_per_call} frames, call {call}");
+                assert_eq!(stats.silent_frames, 0, "{at}");
+                if call > 0 {
+                    assert!(!stats.resynced, "{at}");
+                    let error = p.last_error_ms().expect("cursor on a block");
+                    assert!(error.abs() < 1.0, "{at}: error {error} ms");
+                }
+                for k in 0..frames_per_call {
+                    let f = source_frame(&out, k).expect("no silence");
+                    if let Some(last) = prev {
+                        match f as i64 - last as i64 {
+                            1 => {}
+                            2 => skips += 1,
+                            step => panic!("{at}, frame {k}: source step {step}"),
+                        }
+                    }
+                    prev = Some(f);
+                }
+            }
+            // 60 s at 100 ppm is 6 ms = 288 frames; all but the last ~0.5 ms must be skipped.
+            assert!(
+                skips > 200,
+                "{frames_per_call} frames: {skips} skipped frames"
+            );
+        }
+    }
+
+    #[test]
     fn large_error_resyncs() {
         // From call 5 on, the output time is 100 ms (4800 frames) later: the cursor is 100 ms
         // late, so blocks 5..10 (ending before the new output time) are dropped and the cursor
