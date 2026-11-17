@@ -219,13 +219,14 @@ export class RoomManager {
       return false;
     }
 
-    const clientCount = this.getClients().length;
-    // Don't start playback if there are no clients
-    if (clientCount === 0) {
+    // Streamer clients never load queue tracks, so only web clients are waited for
+    const webClients = this.getClients().filter((client) => client.kind === "web");
+    // Don't start playback if there are no web clients
+    if (webClients.length === 0) {
       return false;
     }
 
-    return this.pendingPlay.clientsLoaded.size === clientCount;
+    return webClients.every((client) => this.pendingPlay?.clientsLoaded.has(client.clientId));
   }
 
   /**
@@ -417,6 +418,7 @@ export class RoomManager {
       clientId,
       isAdmin: false,
       isCreator: ws.data.isCreator,
+      kind: ws.data.kind,
       rtt: 0,
       compensationMs: 0,
       nudgeMs: 0,
@@ -438,9 +440,14 @@ export class RoomManager {
       clientData.nudgeMs = cachedClient.nudgeMs;
     }
 
-    // In demo mode, only the admin secret grants admin. Otherwise, first client gets admin.
-    if (!IS_DEMO_MODE && this.wsConnections.size === 0) {
-      clientData.isAdmin = true;
+    // In demo mode, only the admin secret grants admin. Otherwise the first connection gets admin, and a web client
+    // also gets admin when no other connected web client is admin (a streamer may hold admin but has no admin UI).
+    if (!IS_DEMO_MODE) {
+      const firstConnection = this.wsConnections.size === 0;
+      const noWebAdmin = !this.getClients().some((client) => client.kind === "web" && client.isAdmin);
+      if (firstConnection || (clientData.kind === "web" && noWebAdmin)) {
+        clientData.isAdmin = true;
+      }
     }
 
     // If the client authenticated with the admin secret or is the creator, always grant admin
@@ -482,12 +489,14 @@ export class RoomManager {
       // Check if any admins remain after removing this client
       // In demo mode, skip auto-promotion — only the admin secret grants admin
       if (!IS_DEMO_MODE) {
-        const remainingAdmins = activeClients.filter((client) => client.isAdmin);
+        // Streamers are never promoted and do not count: they have no admin UI
+        const webClients = activeClients.filter((client) => client.kind === "web");
+        const remainingAdmins = webClients.filter((client) => client.isAdmin);
 
-        if (remainingAdmins.length === 0) {
+        if (webClients.length > 0 && remainingAdmins.length === 0) {
           // Promote the most recently active client — promoting a backgrounded
           // lurker could leave a room where nobody present can control playback
-          const newAdmin = activeClients.reduce((a, b) => (a.lastSeenAt >= b.lastSeenAt ? a : b));
+          const newAdmin = webClients.reduce((a, b) => (a.lastSeenAt >= b.lastSeenAt ? a : b));
 
           newAdmin.isAdmin = true;
           this.clientData.set(newAdmin.clientId, newAdmin);

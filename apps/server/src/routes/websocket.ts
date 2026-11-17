@@ -44,6 +44,7 @@ export const handleWebSocketUpgrade = (req: Request, server: BunServer) => {
     clientId,
     isAdmin,
     isCreator,
+    kind: url.searchParams.get("kind") === "streamer" ? "streamer" : "web",
   };
 
   // Upgrade the connection with the WSData context
