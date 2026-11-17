@@ -3,6 +3,7 @@ import { globalManager } from "@/managers";
 import { sendBroadcast, sendToClient, sendUnicast } from "@/utils/responses";
 import type { BunServer, WSData } from "@/utils/websocket";
 import { dispatchMessage } from "@/websocket/dispatch";
+import { relayLiveFrame } from "@/websocket/liveRelay";
 import type { WSBroadcastType } from "@beatsync/shared";
 import { epochNow, WSRequestSchema } from "@beatsync/shared";
 import type { ServerWebSocket } from "bun";
@@ -168,6 +169,12 @@ export const handleOpen = (ws: ServerWebSocket<WSData>, server: BunServer) => {
 };
 
 export const handleMessage = async (ws: ServerWebSocket<WSData>, message: string | Buffer, server: BunServer) => {
+  // Binary frames are live stream audio: relay them without JSON/Zod parsing
+  if (typeof message !== "string") {
+    relayLiveFrame(ws, message);
+    return;
+  }
+
   const t1 = epochNow(); // Always capture immediately on receive
   const { roomId, username } = ws.data;
 
