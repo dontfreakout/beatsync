@@ -24,7 +24,7 @@ use crate::audio::{
     AppInfo, AudioBackend, AudioError, AudioEvent, AudioIo, CHUNK_MAX_FRAMES, CapturedChunk,
     PlayoutShared,
 };
-use crate::clock::{MonoEpochMap, mono_ns};
+use crate::clock::{MonoEpochMap, clock_step_ms, mono_ns};
 use crate::config::Settings;
 use crate::connection::{ConnEvent, Outgoing, build_ws_url, run_connection};
 use crate::encoder::OpusFrameEncoder;
@@ -34,8 +34,9 @@ use crate::playout::{BLOCK_SAMPLES, CHANNELS, PcmBlock};
 use crate::timeline::CaptureTimeline;
 
 const TICK: Duration = Duration::from_millis(10);
-/// The mono→epoch mapping is measured again this often, to follow wall-clock steps.
-const MONO_EPOCH_INTERVAL: Duration = Duration::from_secs(5);
+/// The mono→epoch mapping is measured again this often; a wall-clock step shows up as a jump
+/// of the mapping at most this long after it happened.
+const MONO_EPOCH_INTERVAL: Duration = Duration::from_secs(1);
 /// 20 s of frames: more than a stalled socket lasts before its 5 s write timeout.
 const OUTGOING_CAPACITY: usize = 1024;
 /// Encoded blocks on their way from the worker to the engine.
@@ -121,10 +122,8 @@ impl StreamerHandle {
         };
 
         let shared = Arc::new(PlayoutShared::default());
-        store_f64(
-            &shared.mono_epoch_offset_ms,
-            MonoEpochMap::measure().to_epoch_ms(0),
-        );
+        let mono_epoch_offset_ms = MonoEpochMap::measure().to_epoch_ms(0);
+        store_f64(&shared.mono_epoch_offset_ms, mono_epoch_offset_ms);
         // Full volume until the room says otherwise (the default 0 is silence).
         shared.gain.store(1.0_f32.to_bits(), Ordering::Relaxed);
         shared
@@ -158,6 +157,7 @@ impl StreamerHandle {
             audio_tx: Some(audio_tx),
             status_tx,
             shared,
+            mono_epoch_offset_ms,
             offset_known,
             next_session_id: 0,
             active_session_id: None,
@@ -255,6 +255,9 @@ struct EngineTask {
     audio_tx: Option<mpsc::UnboundedSender<AudioCmd>>,
     status_tx: watch::Sender<Status>,
     shared: Arc<PlayoutShared>,
+    /// The last measured mono→epoch offset; this task is the only writer of
+    /// `shared.mono_epoch_offset_ms`.
+    mono_epoch_offset_ms: f64,
     offset_known: Arc<AtomicBool>,
     next_session_id: u64,
     /// The audio session that runs; failures of other sessions are stale.
@@ -292,10 +295,7 @@ impl EngineTask {
                     }
                 },
                 _ = tick.tick() => self.feed(Input::Tick { now_ms: mono_ms() }),
-                _ = remap.tick() => store_f64(
-                    &self.shared.mono_epoch_offset_ms,
-                    MonoEpochMap::measure().to_epoch_ms(0),
-                ),
+                _ = remap.tick() => self.remap_clock(),
             }
         }
         self.feed(Input::UserStop);
@@ -318,6 +318,19 @@ impl EngineTask {
         let _ = tasks.shutdown_tx.send(true);
         let _ = tasks.connection.await;
         drop(out_tx);
+    }
+
+    /// Measures the mono→epoch offset again. On a wall-clock step the engine moves the server
+    /// offset by the opposite amount, so server time stays continuous, and resyncs NTP.
+    fn remap_clock(&mut self) {
+        let offset_ms = MonoEpochMap::measure().to_epoch_ms(0);
+        let step = clock_step_ms(self.mono_epoch_offset_ms, offset_ms);
+        self.mono_epoch_offset_ms = offset_ms;
+        store_f64(&self.shared.mono_epoch_offset_ms, offset_ms);
+        if let Some(delta_ms) = step {
+            eprintln!("streamer: the system clock stepped by {delta_ms:.1} ms");
+            self.feed(Input::ClockStepped { delta_ms });
+        }
     }
 
     fn feed(&mut self, input: Input) {
@@ -519,11 +532,6 @@ async fn start_session(
             }
         }
     });
-    store_f64(
-        &cx.shared.mono_epoch_offset_ms,
-        MonoEpochMap::measure().to_epoch_ms(0),
-    );
-
     let stop = Arc::new(AtomicBool::new(false));
     let worker = Worker {
         session_id,

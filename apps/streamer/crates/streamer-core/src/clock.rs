@@ -22,8 +22,20 @@ pub fn epoch_ms() -> f64 {
         .map_or(0.0, |d| d.as_secs_f64() * 1000.0)
 }
 
+/// A change of the mono→epoch offset above this between two measurements 1 s apart is a
+/// wall-clock step (chrony's or timesyncd's step, a manual change). A kernel slew changes it by
+/// at most 0.5 ms per second; a faster change is handled like a step too.
+pub const CLOCK_STEP_THRESHOLD_MS: f64 = 2.0;
+
+/// The wall-clock step between two measurements of the mono→epoch offset (epoch − mono, in
+/// ms), or `None` when the change is not above [`CLOCK_STEP_THRESHOLD_MS`].
+pub fn clock_step_ms(previous_offset_ms: f64, current_offset_ms: f64) -> Option<f64> {
+    let delta = current_offset_ms - previous_offset_ms;
+    (delta.abs() > CLOCK_STEP_THRESHOLD_MS).then_some(delta)
+}
+
 /// A pair (monotonic ns, epoch ms) taken at the same moment.
-/// The runtime measures it again every 5 s to follow wall-clock steps.
+/// The runtime measures it again every second to follow wall-clock steps.
 #[derive(Debug, Clone, Copy)]
 pub struct MonoEpochMap {
     mono_ns: i64,
@@ -68,5 +80,14 @@ mod tests {
         let map = MonoEpochMap::measure();
         let diff = (map.to_epoch_ms(mono_ns()) - epoch_ms()).abs();
         assert!(diff < 5.0, "diff was {diff} ms");
+    }
+
+    #[test]
+    fn only_a_change_above_2_ms_is_a_step() {
+        // A slew must not restart NTP every second; a step must shift the server offset.
+        assert_eq!(clock_step_ms(1000.0, 1001.9), None);
+        assert_eq!(clock_step_ms(1000.0, 998.1), None);
+        assert_eq!(clock_step_ms(1000.0, 1002.5), Some(2.5));
+        assert_eq!(clock_step_ms(1000.0, 400.0), Some(-600.0));
     }
 }

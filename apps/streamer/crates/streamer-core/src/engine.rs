@@ -40,6 +40,11 @@ pub enum Input {
     Tick {
         now_ms: f64,
     },
+    /// The wall clock, which NTP measures, stepped by `delta_ms`. The runtime has moved its
+    /// mono→epoch mapping by the same amount.
+    ClockStepped {
+        delta_ms: f64,
+    },
     UserStart {
         apps: Vec<String>,
         delay_ms: u32,
@@ -117,6 +122,9 @@ pub struct Engine {
     validator: ProbePairValidator,
     estimator: NtpEstimator,
     next_group_id: u64,
+    /// Responses of older probe pairs are ignored: they were sent before the NTP state was
+    /// last reset (a clock step), so they may measure across the step.
+    first_valid_group_id: u64,
     /// When the next probe pair is due; `None`: on the next tick.
     next_probe_ms: Option<f64>,
     last_offset_ms: Option<f64>,
@@ -149,6 +157,7 @@ impl Engine {
             validator: ProbePairValidator::default(),
             estimator: NtpEstimator::default(),
             next_group_id: 0,
+            first_valid_group_id: 0,
             next_probe_ms: None,
             last_offset_ms: None,
             phase: Phase::Idle,
@@ -192,6 +201,7 @@ impl Engine {
                 &mut out,
             ),
             Input::Tick { now_ms } => self.on_tick(now_ms, &mut out),
+            Input::ClockStepped { delta_ms } => self.on_clock_step(delta_ms, &mut out),
             Input::UserStart { apps, delay_ms } => {
                 if self.phase == Phase::Idle {
                     self.apps = apps.clone();
@@ -239,15 +249,34 @@ impl Engine {
     /// A new or closed connection: NTP restarts and START must be sent again. The audio
     /// keeps running, so a stream in progress goes back to `Starting`.
     fn reset_connection(&mut self) {
-        self.validator = ProbePairValidator::default();
-        self.estimator.reset();
-        self.next_probe_ms = None;
+        self.reset_ntp();
         self.start_sent = false;
         // The old stream ended with the old socket.
         self.stop_pending_until_ms = None;
         if let Phase::Streaming { .. } = self.phase {
             self.phase = Phase::Starting;
         }
+    }
+
+    /// NTP starts over: probe pairs every 50 ms from the next tick until synced again.
+    fn reset_ntp(&mut self) {
+        self.validator = ProbePairValidator::default();
+        self.estimator.reset();
+        self.next_probe_ms = None;
+        self.first_valid_group_id = self.next_group_id;
+    }
+
+    /// The epoch moved by `delta_ms` against the monotonic clock, so the server offset moves
+    /// by `-delta_ms`: server time, and with it the stamps and the local copy, stays
+    /// continuous. The window holds measurements of the old clock, so NTP starts over; the
+    /// phase and the stream go on.
+    fn on_clock_step(&mut self, delta_ms: f64, out: &mut Vec<Output>) {
+        if let Some(offset_ms) = self.last_offset_ms {
+            let offset_ms = offset_ms - delta_ms;
+            self.last_offset_ms = Some(offset_ms);
+            out.push(Output::ServerOffset { offset_ms });
+        }
+        self.reset_ntp();
     }
 
     fn on_server(&mut self, msg: ServerMessage, out: &mut Vec<Output>) {
@@ -277,7 +306,7 @@ impl Engine {
         index: u8,
         out: &mut Vec<Output>,
     ) {
-        if !self.connected {
+        if !self.connected || group_id < self.first_valid_group_id {
             return;
         }
         let Some(best) = self.validator.on_response(m, group_id, index) else {
@@ -576,6 +605,11 @@ mod tests {
 
         /// `n` ticks 50 ms apart, each answered with an accepted pair (rtt 20, offset 500).
         fn probe_pairs(&mut self, n: usize) -> Vec<Output> {
+            self.probe_pairs_at(n, 500.0)
+        }
+
+        /// `n` ticks 50 ms apart, each answered with an accepted pair (rtt 20, `offset`).
+        fn probe_pairs_at(&mut self, n: usize, offset: f64) -> Vec<Output> {
             let mut out = Vec::new();
             for _ in 0..n {
                 let tick = self.tick(self.now_ms + 50.0);
@@ -583,7 +617,7 @@ mod tests {
                     panic!("one probe pair is due: {tick:?}");
                 };
                 out.extend(tick);
-                out.extend(self.answer(group_id, 20.0, 500.0));
+                out.extend(self.answer(group_id, 20.0, offset));
             }
             out
         }
@@ -824,6 +858,52 @@ mod tests {
         h.feed(Input::Connected);
         // Group ids keep increasing, so a late response of an old pair cannot match.
         assert_eq!(probes(&h.tick(t + 5101.0)), vec![(18, None)]);
+    }
+
+    #[test]
+    fn clock_step_keeps_server_time_and_resyncs() {
+        // NTP measures the wall clock. After a step of +1000 ms the window still holds offsets
+        // of the old clock for up to 40 s, so the stamps would move 1000 ms against the local
+        // copy: the laptop would play ahead of the room.
+        let mut h = Harness::streaming(3);
+        let t = h.now_ms;
+        let in_flight = h.tick(t + 2500.0);
+        let [(stale, _)] = probes(&in_flight)[..] else {
+            panic!("a steady probe pair is due: {in_flight:?}");
+        };
+        let out = h.feed(Input::ClockStepped { delta_ms: 1000.0 });
+        assert_eq!(offsets(&out), vec![-500.0], "server time stays continuous");
+        assert!(!h.status().synced);
+        assert_eq!(h.phase(), Phase::Streaming { stream_id: 3 });
+        assert_eq!(frames(&h.feed(block(0.0))), vec![frame(3, 0, 0.0)]);
+        // The pair sent before the step was measured across it.
+        let out = h.answer(stale, 1.0, -9000.0);
+        assert!(
+            offsets(&out).is_empty(),
+            "a pair from before the step is ignored"
+        );
+        assert_eq!(h.status().rtt_ms, None);
+
+        // New pairs go out at once, then every 50 ms until 16 new measurements.
+        let first = h.tick(h.now_ms + 10.0);
+        let [(group_id, _)] = probes(&first)[..] else {
+            panic!("a probe pair goes out at once: {first:?}");
+        };
+        let mut out = h.answer(group_id, 20.0, -500.0);
+        out.extend(h.probe_pairs_at(14, -500.0));
+        assert!(
+            offsets(&out).is_empty(),
+            "the shifted offset was the new one"
+        );
+        assert!(!h.status().synced, "15 new measurements");
+        h.probe_pairs_at(1, -500.0);
+        assert!(h.status().synced);
+        assert_eq!(h.phase(), Phase::Streaming { stream_id: 3 });
+        assert_eq!(frames(&h.feed(block(20.0))), vec![frame(3, 1, 20.0)]);
+
+        // Without a known offset there is nothing to shift.
+        let mut h = Harness::connected();
+        assert!(offsets(&h.feed(Input::ClockStepped { delta_ms: 1000.0 })).is_empty());
     }
 
     #[test]
