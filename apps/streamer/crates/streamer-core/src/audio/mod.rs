@@ -1,0 +1,108 @@
+//! Audio backend abstraction (spec §9.2): app listing, routing of app streams to a virtual
+//! sink, capture of that sink and the scheduled local copy. Linux uses PipeWire.
+
+use std::fmt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64};
+
+use serde::Serialize;
+
+use crate::playout::PcmBlock;
+
+pub mod apps;
+#[cfg(target_os = "linux")]
+pub mod pipewire;
+
+/// One application that plays audio, as the UI lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppInfo {
+    /// The name the user selects; also the routing key ([`apps::app_key`]).
+    pub name: String,
+    pub binary: Option<String>,
+    /// The UI shows the browser loop warning (spec §9.3, C9).
+    pub is_browser: bool,
+    /// Output streams of the app right now.
+    pub streams: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AudioError {
+    /// PipeWire or WirePlumber is too old, or WirePlumber is not running.
+    UnsupportedVersions,
+    /// No PipeWire server to connect to.
+    Unavailable(String),
+    /// `start` while routing is already started.
+    AlreadyStarted,
+    /// Any other backend failure.
+    Backend(String),
+}
+
+impl fmt::Display for AudioError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedVersions => {
+                f.write_str("PipeWire 1.0 and WirePlumber 0.5 or later required")
+            }
+            Self::Unavailable(reason) => write!(f, "PipeWire is not available: {reason}"),
+            Self::AlreadyStarted => f.write_str("Audio routing is already started"),
+            Self::Backend(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for AudioError {}
+
+/// Events from the audio backend to the runtime while started.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AudioEvent {
+    /// Routing or capture cannot continue (for example, the sink vanished). The runtime
+    /// maps it to the engine's `Input::AudioFailed` and then calls `stop`.
+    Failed(String),
+}
+
+/// Most stereo frames in one [`CapturedChunk`].
+pub const CHUNK_MAX_FRAMES: usize = 1024;
+
+/// Captured PCM from the sink's monitor, stereo interleaved F32 at 48 kHz.
+#[derive(Clone, Copy)]
+pub struct CapturedChunk {
+    /// CLOCK_MONOTONIC time of the first frame, in ns.
+    pub mono_ns_first_frame: i64,
+    /// Valid stereo frames in `samples` (at most [`CHUNK_MAX_FRAMES`]).
+    pub frames: usize,
+    pub samples: [f32; CHUNK_MAX_FRAMES * 2],
+}
+
+/// Values the runtime updates and the real-time playback callback reads.
+#[derive(Debug, Default)]
+pub struct PlayoutShared {
+    /// f64 bits: server time minus local clock time, in ms.
+    pub server_offset_ms: AtomicU64,
+    /// f64 bits: local clock time minus CLOCK_MONOTONIC time, in ms.
+    pub mono_epoch_offset_ms: AtomicU64,
+    /// f32 bits: output gain of the local copy.
+    pub gain: AtomicU32,
+    /// f32 bits: ramp duration of gain changes, in s.
+    pub gain_ramp_s: AtomicU32,
+}
+
+/// The audio ends the backend owns while started; the runtime creates one per `start`.
+pub struct AudioIo {
+    pub capture_tx: rtrb::Producer<CapturedChunk>,
+    pub playout_rx: rtrb::Consumer<PcmBlock>,
+    pub shared: Arc<PlayoutShared>,
+    pub events: tokio::sync::mpsc::UnboundedSender<AudioEvent>,
+}
+
+pub trait AudioBackend: Send + Sync {
+    /// Apps that play audio now, sorted by name, without the streamer itself.
+    fn list_apps(&self) -> Result<Vec<AppInfo>, AudioError>;
+    /// Creates the sink and moves the streams of `apps` (names from [`AppInfo::name`]) to it.
+    fn start(&self, apps: Vec<String>, io: AudioIo) -> Result<(), AudioError>;
+    /// Changes the selection while started; does nothing when stopped.
+    fn update_apps(&self, apps: Vec<String>) -> Result<(), AudioError>;
+    /// Moves the streams back, clears the app's routing entries and removes the sink.
+    /// Returns when this is done; does nothing when stopped.
+    fn stop(&self) -> Result<(), AudioError>;
+}
