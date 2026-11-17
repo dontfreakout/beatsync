@@ -316,8 +316,10 @@ impl Engine {
         self.next_probe_ms = Some(now_ms + interval_ms as f64);
     }
 
-    /// Before START on this connection (e.g. the join handler's state after a reconnect) and
-    /// while idle, states are stale and ignored.
+    /// While `Starting`, only our own state or REJECTED decides: a null or foreign state may be
+    /// the end of another source's stream, and the server may create ours right after it.
+    /// States before START on this connection (e.g. the join handler's after a reconnect) are
+    /// stale.
     fn on_stream_state(
         &mut self,
         stream: Option<LiveStream>,
@@ -328,29 +330,37 @@ impl Engine {
             .as_ref()
             .filter(|s| s.source_client_id == self.client_id)
             .map(|s| s.stream_id);
-        if own_stream_id.is_none() {
+        let Some(stream_id) = own_stream_id else {
             // The echo of our last STOP: START may go out again.
             self.stop_pending_until_ms = None;
-        }
-        if !self.start_sent {
-            return;
-        }
-        if let Some(stream_id) = own_stream_id {
-            let phase = Phase::Streaming { stream_id };
-            // The same stream again (a label update) keeps the sequence.
-            if self.phase != phase {
-                self.phase = phase;
-                self.sequence = 0;
+            if let Phase::Streaming { .. } = self.phase {
+                out.push(Output::StopAudio);
+                self.go_idle();
+                if stream.is_none()
+                    && let Some(id) = stopped_by
+                {
+                    self.message = Some(format!("Stopped by {}", self.username_of(&id)));
+                }
             }
             return;
-        }
-        out.push(Output::StopAudio);
-        self.go_idle();
-        self.message = match stream {
-            // Another source won the race; its REJECTED reply to our START comes later.
-            Some(_) => Some("Another stream is active".to_string()),
-            None => stopped_by.map(|id| format!("Stopped by {}", self.username_of(&id))),
         };
+        match self.phase {
+            Phase::Idle => {
+                // An orphaned stream of ours (e.g. stopped during a disconnect): end it once.
+                if self.stop_pending_until_ms.is_none() {
+                    self.send_stop(out);
+                }
+            }
+            Phase::Starting if !self.start_sent => {}
+            Phase::Starting | Phase::Streaming { .. } => {
+                let phase = Phase::Streaming { stream_id };
+                // The same stream again (a label update) keeps the sequence.
+                if self.phase != phase {
+                    self.phase = phase;
+                    self.sequence = 0;
+                }
+            }
+        }
     }
 
     fn on_rejected(&mut self, reason: RejectReason, out: &mut Vec<Output>) {
@@ -400,11 +410,15 @@ impl Engine {
             return;
         }
         if self.start_sent {
-            out.push(Output::SendJson(ClientMessage::StopLiveStream));
-            self.stop_pending_until_ms = Some(self.now_ms + STOP_ECHO_TIMEOUT_MS);
+            self.send_stop(out);
         }
         out.push(Output::StopAudio);
         self.go_idle();
+    }
+
+    fn send_stop(&mut self, out: &mut Vec<Output>) {
+        out.push(Output::SendJson(ClientMessage::StopLiveStream));
+        self.stop_pending_until_ms = Some(self.now_ms + STOP_ECHO_TIMEOUT_MS);
     }
 
     fn go_idle(&mut self) {
@@ -883,21 +897,56 @@ mod tests {
     }
 
     #[test]
-    fn competing_stream_after_start_is_named() {
+    fn competing_stream_waits_for_the_rejection() {
         let mut h = Harness::connected();
         h.sync();
         h.feed(user_start(&["Spotify"]));
-        // Another source's stream wins the race before the server answers our START.
+        // Another source's stream: only the server's answer to our START decides.
         let out = h.server(state(Some(live_stream(5, "web-1")), None));
-        assert_eq!(without_status(out), vec![Output::StopAudio]);
-        assert_eq!(h.phase(), Phase::Idle);
-        assert_eq!(h.message(), Some("Another stream is active"));
-        // The REJECTED reply that follows is stale.
+        assert!(without_status(out).is_empty());
+        assert_eq!(h.phase(), Phase::Starting);
         let out = h.server(ServerMessage::LiveStreamRejected {
             reason: RejectReason::AlreadyActive,
         });
-        assert!(without_status(out).is_empty());
+        assert_eq!(without_status(out), vec![Output::StopAudio]);
+        assert_eq!(h.phase(), Phase::Idle);
         assert_eq!(h.message(), Some("Another stream is active"));
+    }
+
+    #[test]
+    fn foreign_stream_ending_during_start_keeps_the_session() {
+        let mut h = Harness::connected();
+        h.server(client_change(&[(ME, "alice"), ("web-1", "Bob")]));
+        h.sync();
+        h.feed(user_start(&["Spotify"]));
+        // Bob stops another stream; the server handles our START right after.
+        let out = h.server(state(None, Some("web-1")));
+        assert!(without_status(out).is_empty());
+        assert_eq!(h.phase(), Phase::Starting);
+        assert_eq!(h.message(), None);
+        let out = h.server(own_state(7));
+        assert!(without_status(out).is_empty());
+        assert_eq!(h.phase(), Phase::Streaming { stream_id: 7 });
+        assert_eq!(h.message(), None);
+        assert_eq!(frames(&h.feed(block(0.0))), vec![frame(7, 0, 0.0)]);
+    }
+
+    #[test]
+    fn own_stream_while_idle_is_stopped() {
+        // Stopped during a disconnect: no STOP could go out, and the server kept the stream.
+        let mut h = Harness::streaming(3);
+        h.feed(Input::Disconnected);
+        assert_eq!(
+            without_status(h.feed(Input::UserStop)),
+            vec![Output::StopAudio]
+        );
+        h.feed(Input::Connected);
+        let out = h.server(own_state(3));
+        let stop = Output::SendJson(ClientMessage::StopLiveStream);
+        assert_eq!(without_status(out), vec![stop], "STOP only, no audio");
+        assert_eq!(h.phase(), Phase::Idle);
+        // Once: the STOP is pending.
+        assert!(without_status(h.server(own_state(3))).is_empty());
     }
 
     #[test]
