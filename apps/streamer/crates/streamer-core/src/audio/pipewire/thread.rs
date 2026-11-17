@@ -43,6 +43,27 @@ pub(super) enum Command {
     Stop(Reply<()>),
     /// Stops routing if started, then ends the thread.
     Quit,
+    /// Writes a `target.object` entry for `subject` (tests provoke a refused write).
+    #[cfg(test)]
+    WriteTarget {
+        subject: u32,
+        reply: Reply<()>,
+    },
+}
+
+/// A command and when its caller stops waiting for the answer.
+pub(super) struct Request {
+    pub command: Command,
+    /// After this a `Start`, `UpdateApps` or `ListApps` is dropped unrun, so nothing happens
+    /// that no caller hears about. `Stop` and `Quit` only undo, so they always run.
+    pub expires: Option<Instant>,
+}
+
+impl Request {
+    fn is_expired(&self, now: Instant) -> bool {
+        let undoes = matches!(self.command, Command::Stop(_) | Command::Quit);
+        !undoes && self.expires.is_some_and(|at| now >= at)
+    }
 }
 
 enum GlobalEvent {
@@ -67,7 +88,7 @@ struct Inbox {
     pw_version: Option<String>,
     wp_version: Option<String>,
     globals: Vec<GlobalEvent>,
-    commands: VecDeque<Command>,
+    commands: VecDeque<Request>,
     /// `Stream/Output/Audio` nodes by registry id, with the props of the latest info.
     streams: BTreeMap<u32, StreamEntry>,
     streams_changed: bool,
@@ -86,6 +107,8 @@ struct Bound<P, L> {
 
 struct DefaultMetadata {
     id: u32,
+    /// Core errors about our writes carry this id.
+    proxy_id: u32,
     bound: Bound<Metadata, MetadataListener>,
 }
 
@@ -106,7 +129,7 @@ struct Stopping {
 /// Runs the PipeWire thread until `Quit`. Sends the outcome of connecting and the version
 /// check on `init`; on failure the thread ends by itself.
 pub(super) fn run(
-    command_rx: pw::channel::Receiver<Command>,
+    command_rx: pw::channel::Receiver<Request>,
     init: mpsc::Sender<Result<(), AudioError>>,
 ) {
     let unavailable = |what: &str, e: pw::Error| AudioError::Unavailable(format!("{what}: {e}"));
@@ -187,7 +210,7 @@ pub(super) fn run(
         .register();
     let attached = command_rx.attach(main_loop.loop_(), {
         let inbox = inbox.clone();
-        move |command| inbox.borrow_mut().commands.push_back(command)
+        move |request| inbox.borrow_mut().commands.push_back(request)
     });
 
     let mut worker = Worker::new(inbox, core.clone(), registry.clone(), init);
@@ -234,6 +257,10 @@ fn is_relevant(global: &GlobalObject<&DictRef>) -> bool {
         ObjectType::Client => props.get("application.name") == Some("WirePlumber"),
         _ => false,
     }
+}
+
+fn is_start(request: &Request) -> bool {
+    matches!(request.command, Command::Start { .. })
 }
 
 fn is_stream(props: &DictRef) -> bool {
@@ -307,6 +334,9 @@ impl Worker {
     }
 
     fn next_deadline(&self) -> Option<Instant> {
+        if self.commands_ready() {
+            return Some(Instant::now());
+        }
         let session = self.session.as_ref();
         [
             self.init.as_ref().map(|i| i.deadline),
@@ -317,6 +347,15 @@ impl Worker {
         .into_iter()
         .flatten()
         .min()
+    }
+
+    /// Whether a queued command can run now (a `Start` waits while a stop is in progress).
+    fn commands_ready(&self) -> bool {
+        let inbox = self.inbox.borrow();
+        match inbox.commands.front() {
+            None => false,
+            Some(request) => !(self.stopping.is_some() && is_start(request)),
+        }
     }
 
     fn sync(&self) -> Option<i32> {
@@ -351,6 +390,8 @@ impl Worker {
         self.progress_start(now);
         self.route_if_due(now);
         self.progress_stop(&done, now);
+        // A start that waited for a stop finished above runs now, not at some later wake-up.
+        self.handle_commands(now);
     }
 
     fn on_error(&mut self, error: CoreError) {
@@ -369,7 +410,24 @@ impl Worker {
             let message = format!("Cannot create the Beatsync sink: {}", error.message);
             session.answer_start(Err(AudioError::Backend(message)));
             self.session = None;
+            return;
         }
+        if self
+            .metadata
+            .as_ref()
+            .is_some_and(|m| m.proxy_id == error.id)
+        {
+            let message = format!("PipeWire refused a routing change: {}", error.message);
+            match &mut self.session {
+                Some(session) => session.fail(&message),
+                None => eprintln!("streamer: {message}"),
+            }
+            return;
+        }
+        eprintln!(
+            "streamer: PipeWire error on object {} ({}): {}",
+            error.id, error.res, error.message
+        );
     }
 
     fn on_global(&mut self, global: &GlobalObject<PropertiesBox>, now: Instant) {
@@ -475,6 +533,7 @@ impl Worker {
         self.inbox.borrow_mut().targets.clear();
         self.metadata = Some(DefaultMetadata {
             id: global.id,
+            proxy_id: pw::proxy::ProxyT::upcast_ref(&proxy).id(),
             bound: Bound {
                 _listener: listener,
                 proxy,
@@ -565,17 +624,19 @@ impl Worker {
 
     fn handle_commands(&mut self, now: Instant) {
         loop {
-            let command = {
+            let request = {
                 let mut inbox = self.inbox.borrow_mut();
                 // A start waits until the previous stop is done.
-                let start_next = matches!(inbox.commands.front(), Some(Command::Start { .. }));
-                if self.stopping.is_some() && start_next {
+                if self.stopping.is_some() && inbox.commands.front().is_some_and(is_start) {
                     break;
                 }
                 inbox.commands.pop_front()
             };
-            let Some(command) = command else { break };
-            match command {
+            let Some(request) = request else { break };
+            if request.is_expired(now) {
+                continue;
+            }
+            match request.command {
                 Command::ListApps(reply) => {
                     let _ = reply.send(self.list_apps());
                 }
@@ -590,6 +651,14 @@ impl Worker {
                 Command::Quit => {
                     self.quit = true;
                     self.begin_stop(None, now);
+                }
+                #[cfg(test)]
+                Command::WriteTarget { subject, reply } => {
+                    if let Some(metadata) = &self.metadata {
+                        let proxy = &metadata.bound.proxy;
+                        proxy.set_property(subject, "target.object", Some("Spa:Id"), Some("0"));
+                    }
+                    let _ = reply.send(Ok(()));
                 }
             }
         }
@@ -663,8 +732,12 @@ impl Worker {
             return;
         };
         if session.sink_global.is_some() {
-            session.answer_start(Ok(()));
-            self.route();
+            if session.answer_start(Ok(())) {
+                self.route();
+            } else {
+                // The caller stopped waiting: undo rather than keep a session nobody owns.
+                self.begin_stop(None, now);
+            }
         } else if now >= *deadline {
             session.answer_start(Err(AudioError::Backend(
                 "The Beatsync sink did not appear".to_string(),

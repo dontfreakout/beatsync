@@ -212,11 +212,11 @@ impl Session {
         }
     }
 
-    /// Answers a pending start with `result`.
-    pub fn answer_start(&mut self, result: Result<(), AudioError>) {
-        if let Some((_, reply)) = self.pending_start.take() {
-            let _ = reply.send(result);
-        }
+    /// Answers a pending start with `result`; false when its caller no longer waits.
+    pub fn answer_start(&mut self, result: Result<(), AudioError>) -> bool {
+        self.pending_start
+            .take()
+            .is_some_and(|(_, reply)| reply.send(result).is_ok())
     }
 }
 

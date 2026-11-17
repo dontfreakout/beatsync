@@ -2,7 +2,7 @@
 
 use std::sync::mpsc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ::pipewire as pw;
 
@@ -11,7 +11,7 @@ use super::{AppInfo, AudioBackend, AudioError, AudioIo};
 mod routing;
 mod thread;
 
-use thread::{Command, Reply};
+use thread::{Command, Reply, Request};
 
 /// `application.name` of the streamer's PipeWire connection and streams; streams with it are
 /// never listed or moved.
@@ -32,7 +32,7 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(4);
 /// that thread answers. Dropping it stops routing (if started), removes the sink and ends the
 /// thread.
 pub struct PipeWireBackend {
-    commands: pw::channel::Sender<Command>,
+    commands: pw::channel::Sender<Request>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -63,9 +63,12 @@ impl PipeWireBackend {
             ));
         }
         let (reply, answer) = mpsc::channel();
-        self.commands
-            .send(command(reply))
-            .map_err(|_| no_answer())?;
+        // Expires before `recv_timeout` gives up, so the thread never runs it unheard.
+        let request = Request {
+            command: command(reply),
+            expires: Some(Instant::now() + REPLY_TIMEOUT),
+        };
+        self.commands.send(request).map_err(|_| no_answer())?;
         answer
             .recv_timeout(REPLY_TIMEOUT)
             .unwrap_or_else(|_| Err(no_answer()))
@@ -96,7 +99,10 @@ impl AudioBackend for PipeWireBackend {
 
 impl Drop for PipeWireBackend {
     fn drop(&mut self) {
-        let _ = self.commands.send(Command::Quit);
+        let _ = self.commands.send(Request {
+            command: Command::Quit,
+            expires: None,
+        });
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -120,7 +126,6 @@ mod tests {
 
     use std::process::{Child, Command as Process, Stdio};
     use std::sync::{Arc, Mutex, MutexGuard};
-    use std::time::Instant;
 
     use serde_json::Value;
     use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
@@ -521,6 +526,77 @@ mod tests {
             metadata_line(id, "target.object")
         );
         assert!(linked_only_to(&app, &default), "{:?}", links_from(&app));
+    }
+
+    /// Sends `Stop` and `Start` back to back, so the start waits in the queue behind the stop.
+    fn stop_then_start(
+        backend: &PipeWireBackend,
+        io: AudioIo,
+    ) -> (Result<(), AudioError>, Result<(), AudioError>) {
+        let expires = Some(Instant::now() + REPLY_TIMEOUT);
+        let (stop_reply, stopped) = mpsc::channel();
+        let (start_reply, started) = mpsc::channel();
+        let stop = Command::Stop(stop_reply);
+        let start = Command::Start {
+            apps: Vec::new(),
+            io,
+            reply: start_reply,
+        };
+        for command in [stop, start] {
+            let sent = backend.commands.send(Request { command, expires });
+            assert!(sent.is_ok(), "command sent");
+        }
+        let answer = |rx: mpsc::Receiver<Result<(), AudioError>>| {
+            rx.recv_timeout(REPLY_TIMEOUT)
+                .unwrap_or_else(|_| Err(no_answer()))
+        };
+        (answer(stopped), answer(started))
+    }
+
+    #[test]
+    #[ignore = "needs a live PipeWire session"]
+    fn start_right_after_stop_succeeds() {
+        let _lock = lock();
+        let pid = std::process::id();
+        let backend = PipeWireBackend::new().expect("backend");
+        let (io, _events) = test_io();
+        backend.start(Vec::new(), io).expect("start");
+        assert_eq!(sinks_of(pid), vec![format!("beatsync-{pid}-1")]);
+
+        let (io, _events) = test_io();
+        let begin = Instant::now();
+        let (stopped, started) = stop_then_start(&backend, io);
+        let took = begin.elapsed();
+        assert_eq!(stopped, Ok(()));
+        assert_eq!(started, Ok(()));
+        assert!(
+            took < Duration::from_secs(1),
+            "the start does not wait for an unrelated wake-up: {took:?}"
+        );
+        assert_eq!(sinks_of(pid), vec![format!("beatsync-{pid}-2")]);
+        drop(backend);
+        assert!(wait_until(Duration::from_secs(2), || sinks_of(pid).is_empty()));
+    }
+
+    #[test]
+    #[ignore = "needs a live PipeWire session"]
+    fn reports_a_rejected_metadata_write() {
+        let _lock = lock();
+        let backend = PipeWireBackend::new().expect("backend");
+        let (io, mut events) = test_io();
+        backend.start(Vec::new(), io).expect("start");
+        // No object has this id, so the server refuses the write.
+        let write = backend.call(|reply| Command::WriteTarget {
+            subject: 999_999,
+            reply,
+        });
+        write.expect("write sent");
+        let failed = wait_until(
+            Duration::from_secs(3),
+            || matches!(events.try_recv(), Ok(AudioEvent::Failed(m)) if m.contains("refused")),
+        );
+        assert!(failed, "the runtime hears about the refused write");
+        backend.stop().expect("stop");
     }
 
     #[test]
