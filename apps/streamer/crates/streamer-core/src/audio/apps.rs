@@ -18,6 +18,13 @@ pub struct StreamNode {
     pub target_object: Option<String>,
 }
 
+/// A `target.object` entry of the `default` metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetaValue {
+    pub type_: Option<String>,
+    pub value: String,
+}
+
 /// The app a stream belongs to: `application.name`, else the binary, else `node.name`.
 pub fn app_key(n: &StreamNode) -> Option<String> {
     [&n.app_name, &n.binary, &n.node_name]
@@ -111,6 +118,21 @@ pub fn routing_actions(
                 _ => None,
             }
         })
+        .collect()
+}
+
+/// Moved streams whose `target.object` entry (`targets`, by subject) no longer holds the sink
+/// serial: the user or another tool moved them away or deleted the entry. Their choice wins,
+/// so the streamer neither moves them back nor restores them.
+pub fn moved_away(
+    moved: &BTreeSet<u32>,
+    targets: &BTreeMap<u32, MetaValue>,
+    sink_serial: &str,
+) -> Vec<u32> {
+    moved
+        .iter()
+        .copied()
+        .filter(|id| targets.get(id).is_none_or(|t| t.value != sink_serial))
         .collect()
 }
 
@@ -256,6 +278,25 @@ mod tests {
                 RouteAction::Restore { node_id: 12 },
             ]
         );
+    }
+
+    #[test]
+    fn streams_the_user_moved_away_are_left_alone() {
+        let entry = |value: &str| MetaValue {
+            type_: Some("Spa:Id".to_string()),
+            value: value.to_string(),
+        };
+        let targets = BTreeMap::from([
+            (10, entry("500")),
+            // pavucontrol's "back to the default sink".
+            (11, entry("-1")),
+            // 12: the user deleted the entry.
+            // 13 points at the sink but was not moved by the streamer.
+            (13, entry("500")),
+            (14, entry("77")),
+        ]);
+        let moved = BTreeSet::from([10, 11, 12, 14]);
+        assert_eq!(moved_away(&moved, &targets, "500"), vec![11, 12, 14]);
     }
 
     #[test]

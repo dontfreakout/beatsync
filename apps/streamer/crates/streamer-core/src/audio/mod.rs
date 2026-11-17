@@ -102,7 +102,8 @@ pub trait AudioBackend: Send + Sync {
     fn start(&self, apps: Vec<String>, io: AudioIo) -> Result<(), AudioError>;
     /// Changes the selection while started; does nothing when stopped.
     fn update_apps(&self, apps: Vec<String>) -> Result<(), AudioError>;
-    /// Moves the streams back, clears the app's routing entries and removes the sink.
-    /// Returns when this is done; does nothing when stopped.
+    /// Moves the streams back, clears the app's routing entries and removes the sink. A stream
+    /// the user moved elsewhere meanwhile keeps the user's target. Returns when this is done;
+    /// does nothing when stopped.
     fn stop(&self) -> Result<(), AudioError>;
 }

@@ -209,6 +209,14 @@ mod tests {
         u32::try_from(id).ok()
     }
 
+    fn node_serial(name: &str) -> Option<u64> {
+        let dump: Value = serde_json::from_str(&output("pw-dump", &[])).ok()?;
+        let node = dump.as_array()?.iter().find(|o| {
+            o["type"] == "PipeWire:Interface:Node" && o["info"]["props"]["node.name"] == name
+        })?;
+        node["info"]["props"]["object.serial"].as_u64()
+    }
+
     /// The `pw-metadata -n default` line of `key` on subject `id`.
     fn metadata_line(id: u32, key: &str) -> Option<String> {
         let needle = format!("id:{id} key:'{key}'");
@@ -448,6 +456,71 @@ mod tests {
         assert_eq!(metadata_line(id, "target.object"), None);
         backend.stop().expect("stop");
         assert!(events.try_recv().is_err(), "no failure reported");
+    }
+
+    #[test]
+    #[ignore = "needs a live PipeWire session"]
+    fn user_move_away_is_kept_on_stop() {
+        let _lock = lock();
+        let app = format!("beatsync-test-{}", std::process::id());
+        let _tone = play_silence(&app);
+        let backend = PipeWireBackend::new().expect("backend");
+        wait_listed(&backend, &app);
+        let id = node_id(&app).expect("stream node");
+        let (io, _events) = test_io();
+        backend.start(vec![app.clone()], io).expect("start");
+        let sink = sinks_of(std::process::id()).pop().expect("sink");
+        assert!(
+            wait_until(Duration::from_secs(3), || linked_only_to(&app, &sink)),
+            "moved to the sink: {:?}",
+            links_from(&app)
+        );
+
+        // The user moves the stream to the real default sink, as pavucontrol or pw-metadata do.
+        let default = default_sink_name();
+        let serial = node_serial(&default)
+            .expect("default sink serial")
+            .to_string();
+        let subject = id.to_string();
+        let args = [
+            "-n",
+            "default",
+            "--",
+            &subject,
+            "target.object",
+            &serial,
+            "Spa:Id",
+        ];
+        output("pw-metadata", &args);
+        let users_target = || {
+            let line = metadata_line(id, "target.object");
+            line.is_some_and(|l| l.contains(&format!("value:'{serial}'")))
+        };
+        assert!(
+            wait_until(Duration::from_secs(3), || {
+                users_target() && linked_only_to(&app, &default)
+            }),
+            "the user's move: {:?}",
+            links_from(&app)
+        );
+
+        // A routing pass while the app stays selected does not move it back.
+        backend.update_apps(vec![app.clone()]).expect("update_apps");
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(
+            users_target() && linked_only_to(&app, &default),
+            "kept while streaming: {:?} {:?}",
+            metadata_line(id, "target.object"),
+            links_from(&app)
+        );
+
+        backend.stop().expect("stop");
+        assert!(
+            users_target(),
+            "stop keeps the user's target: {:?}",
+            metadata_line(id, "target.object")
+        );
+        assert!(linked_only_to(&app, &default), "{:?}", links_from(&app));
     }
 
     #[test]

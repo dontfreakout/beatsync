@@ -24,7 +24,7 @@ use pw::types::ObjectType;
 
 use super::routing::{Session, SinkGlobal, sink_properties};
 use super::{INIT_TIMEOUT, OWN_APP_NAME, SINK_TIMEOUT, STOP_TIMEOUT};
-use crate::audio::apps::{StreamNode, check_versions, group_apps};
+use crate::audio::apps::{MetaValue, StreamNode, check_versions, group_apps};
 use crate::audio::{AppInfo, AudioError, AudioIo};
 
 pub(super) type Reply<T> = mpsc::Sender<Result<T, AudioError>>;
@@ -43,13 +43,6 @@ pub(super) enum Command {
     Stop(Reply<()>),
     /// Stops routing if started, then ends the thread.
     Quit,
-}
-
-/// A `target.object` entry of the `default` metadata.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct MetaValue {
-    pub type_: Option<String>,
-    pub value: String,
 }
 
 enum GlobalEvent {

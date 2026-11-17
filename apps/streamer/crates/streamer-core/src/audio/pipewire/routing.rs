@@ -10,8 +10,10 @@ use pw::node::Node;
 use pw::properties::{PropertiesBox, properties};
 
 use super::ROUTE_DEBOUNCE;
-use super::thread::{MetaValue, Reply};
-use crate::audio::apps::{RouteAction, StreamNode, routing_actions};
+use super::thread::Reply;
+use crate::audio::apps::{
+    MetaValue, RouteAction, StreamNode, app_key, moved_away, routing_actions,
+};
 use crate::audio::{AudioError, AudioEvent, AudioIo};
 
 const TARGET_OBJECT: &str = "target.object";
@@ -53,6 +55,9 @@ pub(super) struct Session {
     selected: Vec<String>,
     /// Moved stream id -> its `target.object` metadata entry before the move.
     moved: BTreeMap<u32, Option<MetaValue>>,
+    /// Moved streams the user moved away from the sink: left where the user put them while
+    /// their app stays selected.
+    released: BTreeSet<u32>,
     route_at: Option<Instant>,
     /// Answered when the sink shows up in the registry.
     pub pending_start: Option<(Instant, Reply<()>)>,
@@ -78,6 +83,7 @@ impl Session {
             sink_global: None,
             selected,
             moved: BTreeMap::new(),
+            released: BTreeSet::new(),
             route_at: None,
             pending_start: Some((start_deadline, reply)),
             failed: false,
@@ -117,6 +123,16 @@ impl Session {
     /// A stream vanished; PipeWire drops its metadata entries itself.
     pub fn forget(&mut self, node_id: u32) {
         self.moved.remove(&node_id);
+        self.released.remove(&node_id);
+    }
+
+    /// Stops managing moved streams that the user moved away; their target stays.
+    fn release_moved_away(&mut self, targets: &BTreeMap<u32, MetaValue>, serial: &str) {
+        let moved: BTreeSet<u32> = self.moved.keys().copied().collect();
+        for node_id in moved_away(&moved, targets, serial) {
+            self.moved.remove(&node_id);
+            self.released.insert(node_id);
+        }
     }
 
     /// Reports a failure to the runtime once and stops routing.
@@ -138,8 +154,21 @@ impl Session {
         let Some(serial) = self.sink_global.as_ref().map(|s| s.serial.clone()) else {
             return;
         };
+        self.release_moved_away(targets, &serial);
+        // A released stream is moved again only after its app was unselected and selected
+        // again (or as a new stream).
+        self.released.retain(|id| {
+            nodes
+                .iter()
+                .any(|n| n.id == *id && app_key(n).is_some_and(|k| self.selected.contains(&k)))
+        });
+        let routable: Vec<StreamNode> = nodes
+            .iter()
+            .filter(|n| !self.released.contains(&n.id))
+            .cloned()
+            .collect();
         let moved: BTreeSet<u32> = self.moved.keys().copied().collect();
-        for action in routing_actions(&self.selected, nodes, &moved) {
+        for action in routing_actions(&self.selected, &routable, &moved) {
             match action {
                 RouteAction::Move { node_id } => {
                     // An entry that already points at the sink (WirePlumber's stream-restore)
@@ -160,9 +189,14 @@ impl Session {
         }
     }
 
-    /// Gives every moved stream its previous target back (or deletes the entry) and deletes
-    /// every other entry that points at the sink.
+    /// Gives every moved stream that still points at the sink its previous target back (or
+    /// deletes the entry), and deletes every other entry that points at the sink. Streams the
+    /// user moved away keep the user's target.
     pub fn restore_all(&mut self, metadata: &Metadata, targets: &mut BTreeMap<u32, MetaValue>) {
+        if let Some(serial) = self.sink_global.as_ref().map(|s| s.serial.clone()) {
+            self.release_moved_away(targets, &serial);
+        }
+        self.released.clear();
         for (node_id, previous) in std::mem::take(&mut self.moved) {
             write_target(metadata, targets, node_id, previous);
         }
