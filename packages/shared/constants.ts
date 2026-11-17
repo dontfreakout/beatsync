@@ -39,4 +39,6 @@ export const LIVE_STREAM_CONSTANTS = {
   MAX_LABEL_LENGTH: 100,
   FRAME_KIND_AUDIO: 1,
   FRAME_HEADER_BYTES: 17,
+  /** Largest binary frame the server relays, header included (a 20 ms Opus packet is at most 1275 bytes) */
+  MAX_FRAME_BYTES: 4096,
 } as const;

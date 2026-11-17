@@ -171,7 +171,12 @@ export const handleOpen = (ws: ServerWebSocket<WSData>, server: BunServer) => {
 export const handleMessage = async (ws: ServerWebSocket<WSData>, message: string | Buffer, server: BunServer) => {
   // Binary frames are live stream audio: relay them without JSON/Zod parsing
   if (typeof message !== "string") {
-    relayLiveFrame(ws, message);
+    try {
+      relayLiveFrame(ws, message);
+    } catch (error) {
+      // Logs only on failure: the success path runs for every frame
+      console.error(`Error relaying live frame from ${ws.data.clientId} in room ${ws.data.roomId}:`, error);
+    }
     return;
   }
 

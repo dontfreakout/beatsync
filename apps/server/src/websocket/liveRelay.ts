@@ -1,4 +1,4 @@
-import { decodeLiveFrame } from "@beatsync/shared";
+import { decodeLiveFrame, LIVE_STREAM_CONSTANTS } from "@beatsync/shared";
 import type { ServerWebSocket } from "bun";
 import { globalManager } from "@/managers";
 import type { WSData } from "@/utils/websocket";
@@ -17,6 +17,9 @@ export function relayLiveFrame(ws: ServerWebSocket<WSData>, data: Uint8Array): b
 
   const stream = room.getLiveStream();
   if (stream?.sourceClientId !== clientId) return false;
+
+  // Every relayed frame is fanned out to the whole room
+  if (data.byteLength > LIVE_STREAM_CONSTANTS.MAX_FRAME_BYTES) return false;
 
   const frame = decodeLiveFrame(data);
   if (frame?.header.streamId !== stream.streamId) return false;

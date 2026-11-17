@@ -1,5 +1,5 @@
 import type { ExtractWSRequestFrom } from "@beatsync/shared";
-import { encodeLiveFrame } from "@beatsync/shared";
+import { encodeLiveFrame, LIVE_STREAM_CONSTANTS } from "@beatsync/shared";
 import type { mock } from "bun:test";
 import { beforeEach, describe, expect, it } from "bun:test";
 import { createMockServer, createMockWs } from "@/__tests__/mocks/websocket";
@@ -78,6 +78,18 @@ describe("Live relay", () => {
     foreign[0] = 2;
     expect(relayLiveFrame(sourceWs, foreign)).toBe(false);
     expect(publishMock(sourceWs)).not.toHaveBeenCalled();
+  });
+
+  it("drops frames larger than MAX_FRAME_BYTES", () => {
+    const stream = start();
+    const { MAX_FRAME_BYTES, FRAME_HEADER_BYTES } = LIVE_STREAM_CONSTANTS;
+    const header = { streamId: stream.streamId, sequence: 1, captureServerTimeMs: 1000 };
+    const largest = encodeLiveFrame(header, new Uint8Array(MAX_FRAME_BYTES - FRAME_HEADER_BYTES));
+    const oversized = encodeLiveFrame(header, new Uint8Array(MAX_FRAME_BYTES - FRAME_HEADER_BYTES + 1));
+    expect(relayLiveFrame(sourceWs, oversized)).toBe(false);
+    expect(publishMock(sourceWs)).not.toHaveBeenCalled();
+    expect(relayLiveFrame(sourceWs, largest)).toBe(true);
+    expect(publishMock(sourceWs)).toHaveBeenCalledTimes(1);
   });
 
   it("a binary message marks the sender as seen", async () => {
