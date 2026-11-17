@@ -17,6 +17,8 @@ const CODEC: &str = "opus";
 const CHANNELS: u8 = 2;
 /// Ramp of STOP_SPATIAL_AUDIO, the web client's `applyFinalGain` default.
 const STOP_SPATIAL_RAMP_S: f32 = 0.1;
+/// How long START waits for the echo of our STOP; the server sends none when it has no stream.
+const STOP_ECHO_TIMEOUT_MS: f64 = 2000.0;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Input {
@@ -125,6 +127,11 @@ pub struct Engine {
     /// START was sent on the current connection, so the server has or is creating our
     /// stream (it handles the messages of one socket in order). False whenever `Idle`.
     start_sent: bool,
+    /// Until when START waits for the echo of our STOP (a null or foreign stream state), so
+    /// that the echo cannot end the next session.
+    stop_pending_until_ms: Option<f64>,
+    /// The time of the last tick.
+    now_ms: f64,
     sequence: u32,
     clients: Vec<ClientData>,
     message: Option<String>,
@@ -148,6 +155,8 @@ impl Engine {
             apps: Vec::new(),
             delay_ms: 0,
             start_sent: false,
+            stop_pending_until_ms: None,
+            now_ms: 0.0,
             sequence: 0,
             clients: Vec::new(),
             message: None,
@@ -234,6 +243,8 @@ impl Engine {
         self.estimator.reset();
         self.next_probe_ms = None;
         self.start_sent = false;
+        // The old stream ended with the old socket.
+        self.stop_pending_until_ms = None;
         if let Phase::Streaming { .. } = self.phase {
             self.phase = Phase::Starting;
         }
@@ -282,6 +293,13 @@ impl Engine {
     }
 
     fn on_tick(&mut self, now_ms: f64, out: &mut Vec<Output>) {
+        self.now_ms = now_ms;
+        if self
+            .stop_pending_until_ms
+            .is_some_and(|until| now_ms >= until)
+        {
+            self.stop_pending_until_ms = None;
+        }
         if !self.connected || self.next_probe_ms.is_some_and(|due| now_ms < due) {
             return;
         }
@@ -306,28 +324,33 @@ impl Engine {
         stopped_by: Option<String>,
         out: &mut Vec<Output>,
     ) {
+        let own_stream_id = stream
+            .as_ref()
+            .filter(|s| s.source_client_id == self.client_id)
+            .map(|s| s.stream_id);
+        if own_stream_id.is_none() {
+            // The echo of our last STOP: START may go out again.
+            self.stop_pending_until_ms = None;
+        }
         if !self.start_sent {
             return;
         }
-        match stream {
-            Some(s) if s.source_client_id == self.client_id => {
-                let phase = Phase::Streaming {
-                    stream_id: s.stream_id,
-                };
-                // The same stream again (a label update) keeps the sequence.
-                if self.phase != phase {
-                    self.phase = phase;
-                    self.sequence = 0;
-                }
+        if let Some(stream_id) = own_stream_id {
+            let phase = Phase::Streaming { stream_id };
+            // The same stream again (a label update) keeps the sequence.
+            if self.phase != phase {
+                self.phase = phase;
+                self.sequence = 0;
             }
-            _ => {
-                out.push(Output::StopAudio);
-                self.go_idle();
-                if let Some(id) = stopped_by {
-                    self.message = Some(format!("Stopped by {}", self.username_of(&id)));
-                }
-            }
+            return;
         }
+        out.push(Output::StopAudio);
+        self.go_idle();
+        self.message = match stream {
+            // Another source won the race; its REJECTED reply to our START comes later.
+            Some(_) => Some("Another stream is active".to_string()),
+            None => stopped_by.map(|id| format!("Stopped by {}", self.username_of(&id))),
+        };
     }
 
     fn on_rejected(&mut self, reason: RejectReason, out: &mut Vec<Output>) {
@@ -378,6 +401,7 @@ impl Engine {
         }
         if self.start_sent {
             out.push(Output::SendJson(ClientMessage::StopLiveStream));
+            self.stop_pending_until_ms = Some(self.now_ms + STOP_ECHO_TIMEOUT_MS);
         }
         out.push(Output::StopAudio);
         self.go_idle();
@@ -393,6 +417,7 @@ impl Engine {
             || self.start_sent
             || !self.connected
             || !self.estimator.is_synced()
+            || self.stop_pending_until_ms.is_some()
         {
             return;
         }
@@ -849,12 +874,78 @@ mod tests {
         h.server(state(None, Some("ghost-id")));
         assert_eq!(h.message(), Some("Stopped by ghost-id"));
 
-        // Another source's stream without stoppedBy: stop without a message.
+        // Ended without stoppedBy (e.g. by the server): stop without a message.
         let mut h = Harness::streaming(3);
-        let out = h.server(state(Some(live_stream(5, "web-1")), None));
+        let out = h.server(state(None, None));
         assert_eq!(without_status(out), vec![Output::StopAudio]);
         assert_eq!(h.phase(), Phase::Idle);
         assert_eq!(h.message(), None);
+    }
+
+    #[test]
+    fn competing_stream_after_start_is_named() {
+        let mut h = Harness::connected();
+        h.sync();
+        h.feed(user_start(&["Spotify"]));
+        // Another source's stream wins the race before the server answers our START.
+        let out = h.server(state(Some(live_stream(5, "web-1")), None));
+        assert_eq!(without_status(out), vec![Output::StopAudio]);
+        assert_eq!(h.phase(), Phase::Idle);
+        assert_eq!(h.message(), Some("Another stream is active"));
+        // The REJECTED reply that follows is stale.
+        let out = h.server(ServerMessage::LiveStreamRejected {
+            reason: RejectReason::AlreadyActive,
+        });
+        assert!(without_status(out).is_empty());
+        assert_eq!(h.message(), Some("Another stream is active"));
+    }
+
+    #[test]
+    fn stop_then_start_waits_for_the_stop_echo() {
+        let mut h = Harness::streaming(3);
+        h.feed(Input::UserStop);
+        let out = h.feed(user_start(&["Spotify"]));
+        let start_audio = Output::StartAudio {
+            apps: strings(&["Spotify"]),
+            delay_ms: 1000,
+        };
+        assert_eq!(
+            without_status(out),
+            vec![start_audio],
+            "audio starts at once"
+        );
+        assert!(starts(&h.tick(h.now_ms + 10.0)).is_empty());
+
+        // The STOP's echo ends the old stream only: the new session goes on and sends START.
+        let out = h.server(state(None, None));
+        assert!(!out.contains(&Output::StopAudio));
+        assert_eq!(start_label(&out), "Spotify");
+        assert_eq!(h.phase(), Phase::Starting);
+        h.server(own_state(4));
+        assert_eq!(h.phase(), Phase::Streaming { stream_id: 4 });
+        assert_eq!(frames(&h.feed(block(0.0))), vec![frame(4, 0, 0.0)]);
+    }
+
+    #[test]
+    fn stop_without_echo_holds_start_for_2000_ms() {
+        // START sent but no stream yet; the server sends nothing for a STOP without a stream.
+        let mut h = Harness::connected();
+        h.sync();
+        h.feed(user_start(&["Spotify"]));
+        let t = h.now_ms;
+        h.feed(Input::UserStop);
+        h.feed(user_start(&["Spotify"]));
+        assert!(starts(&h.tick(t + 1999.0)).is_empty());
+        assert_eq!(start_label(&h.tick(t + 2000.0)), "Spotify");
+
+        // A reconnect ends the wait: the old stream ended with the old socket.
+        let mut h = Harness::streaming(3);
+        h.feed(Input::UserStop);
+        h.feed(Input::Disconnected);
+        h.feed(Input::Connected);
+        h.feed(user_start(&["Spotify"]));
+        // The resync takes 800 ms, less than the 2000 ms wait.
+        assert_eq!(start_label(&h.sync()), "Spotify");
     }
 
     /// after a reconnect and resync, START is sent again and frames use the new streamId from sequence 0
