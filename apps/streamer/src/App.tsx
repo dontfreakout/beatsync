@@ -65,8 +65,12 @@ function fromDraft(base: Settings, draft: Draft): Settings {
   };
 }
 
-function sameFields(a: Settings, b: Settings): boolean {
-  return DRAFT_KEYS.every((key) => a[key] === b[key]);
+function sameSettings(a: Settings, b: Settings): boolean {
+  return (
+    DRAFT_KEYS.every((key) => a[key] === b[key]) &&
+    a.selectedApps.length === b.selectedApps.length &&
+    a.selectedApps.every((name, i) => name === b.selectedApps[i])
+  );
 }
 
 /** Shows the saved value in each field that the user has not edited since `sent`. */
@@ -149,17 +153,17 @@ export function App() {
     void refreshApps();
   }, [refreshApps, setDraft, setSelected, setSettings, setStatus]);
 
-  /** Saves the typed fields; false when the save failed. */
+  /** Saves the typed fields with the current selection; false when the save failed. */
   const commit = useCallback(
     () =>
       enqueue(async () => {
         const base = settingsRef.current;
         const sent = draftRef.current;
         if (!base || !sent) return true;
-        const next = fromDraft(base, sent);
+        const next = { ...fromDraft(base, sent), selectedApps: selectedRef.current };
         try {
           let saved = base;
-          if (!sameFields(next, base)) {
+          if (!sameSettings(next, base)) {
             saved = await saveSettings(next);
             setSettings(saved);
             setError(null);
@@ -191,7 +195,7 @@ export function App() {
           const base = settingsRef.current;
           if (base) setSettings(await saveSettings({ ...base, selectedApps: next }));
         } else {
-          await updateApps(next);
+          setSettings(await updateApps(next));
         }
       } catch (e) {
         setError(errorText(e));
@@ -203,7 +207,7 @@ export function App() {
     setBusy(true);
     try {
       if (!(await commit())) return;
-      await enqueue(() => startStream(selectedRef.current));
+      setSettings(await enqueue(() => startStream(selectedRef.current)));
       setError(null);
     } catch (e) {
       setError(errorText(e));

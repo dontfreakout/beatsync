@@ -173,10 +173,13 @@ pub async fn list_apps(state: State<'_, AppState>) -> CommandResult<Vec<AppInfo>
     }
 }
 
-/// Saves the selection and starts streaming it with the saved delay. The stream starts even
-/// when the selection cannot be saved; the error is returned then.
+/// Saves the selection, starts streaming it with the saved delay and returns the settings. The
+/// stream starts even when the selection cannot be saved; the error is returned then.
 #[tauri::command]
-pub async fn start_stream(state: State<'_, AppState>, apps: Vec<String>) -> CommandResult<()> {
+pub async fn start_stream(
+    state: State<'_, AppState>,
+    apps: Vec<String>,
+) -> CommandResult<Settings> {
     if let Err(e) = &state.backend {
         return Err(e.clone());
     }
@@ -187,19 +190,21 @@ pub async fn start_stream(state: State<'_, AppState>, apps: Vec<String>) -> Comm
         return Err("Enter a room and a name first".to_string());
     };
     handle.start(apps, session.settings.delay_ms);
-    saved.map_err(save_error)
+    saved.map_err(save_error)?;
+    Ok(session.settings.clone())
 }
 
-/// Saves the selection and changes the streamed apps (when streaming).
+/// Saves the selection, changes the streamed apps (when streaming) and returns the settings.
 #[tauri::command]
-pub async fn update_apps(state: State<'_, AppState>, apps: Vec<String>) -> CommandResult<()> {
+pub async fn update_apps(state: State<'_, AppState>, apps: Vec<String>) -> CommandResult<Settings> {
     let mut session = state.session.lock().await;
     session.settings.selected_apps = apps.clone();
     let saved = config::save(&session.settings);
     if let Some(handle) = &session.handle {
         handle.update_apps(apps);
     }
-    saved.map_err(save_error)
+    saved.map_err(save_error)?;
+    Ok(session.settings.clone())
 }
 
 /// Stops the stream; returns when the routing is restored.

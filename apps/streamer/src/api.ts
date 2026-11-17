@@ -38,9 +38,11 @@ export const saveSettings = (settings: Settings) => invoke<Settings>("save_setti
 /** Rejects with the backend error, e.g. "PipeWire 1.0 and WirePlumber 0.5 or later required". */
 export const listApps = () => invoke<AppInfo[]>("list_apps");
 
-export const startStream = (apps: string[]) => invoke<void>("start_stream", { apps });
+/** Saves the selection, starts the stream and returns the saved settings. */
+export const startStream = (apps: string[]) => invoke<Settings>("start_stream", { apps });
 
-export const updateApps = (apps: string[]) => invoke<void>("update_apps", { apps });
+/** Saves the selection, changes the streamed apps and returns the saved settings. */
+export const updateApps = (apps: string[]) => invoke<Settings>("update_apps", { apps });
 
 /** Resolves when the routing is restored. */
 export const stopStream = () => invoke<void>("stop_stream");
