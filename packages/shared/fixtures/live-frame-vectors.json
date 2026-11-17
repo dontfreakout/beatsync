@@ -1,0 +1,4 @@
+[
+  { "hex": "01070000000201000000b807549b337942aabb", "streamId": 7, "sequence": 258, "captureServerTimeMs": 1731840000123.5, "payloadHex": "aabb" },
+  { "hex": "01ffffffffffffffff0000000000000000", "streamId": 4294967295, "sequence": 4294967295, "captureServerTimeMs": 0, "payloadHex": "" }
+]
