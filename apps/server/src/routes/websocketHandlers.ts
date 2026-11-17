@@ -245,7 +245,8 @@ export const handleClose = (ws: ServerWebSocket<WSData>, server: BunServer) => {
     const { roomId, clientId } = ws.data;
     const room = globalManager.getRoom(roomId);
 
-    if (room) {
+    // A late close of a replaced socket must not remove the reconnected client
+    if (room?.isCurrentConnection(clientId, ws)) {
       room.removeClient(clientId);
 
       // Schedule cleanup for rooms with no active connections

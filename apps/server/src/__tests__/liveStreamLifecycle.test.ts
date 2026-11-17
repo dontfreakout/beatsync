@@ -3,7 +3,7 @@ import { epochNow } from "@beatsync/shared";
 import { beforeEach, describe, expect, it, mock } from "bun:test";
 import { createMockServer, createMockWs } from "@/__tests__/mocks/websocket";
 import { globalManager } from "@/managers/GlobalManager";
-import { handleOpen } from "@/routes/websocketHandlers";
+import { handleClose, handleOpen } from "@/routes/websocketHandlers";
 import type { BunServer } from "@/utils/websocket";
 import { handlePlay } from "@/websocket/handlers/play";
 import { handleStartLiveStream } from "@/websocket/handlers/startLiveStream";
@@ -69,6 +69,32 @@ describe("Live stream lifecycle", () => {
     otherWs = createMockWs({ clientId: "other", roomId: ROOM_ID });
     r.addClient(adminWs); // first client is admin
     r.addClient(otherWs);
+  });
+
+  it("a late close of an old socket does not end the stream of the reconnected source", async () => {
+    await handleStartLiveStream({ ws: adminWs, message: startMsg(), server });
+    const ws2 = createMockWs({ clientId: "admin", roomId: ROOM_ID });
+    room().addClient(ws2);
+    handleClose(adminWs, server);
+    expect(room().getLiveStream()).not.toBeNull();
+    expect(
+      room()
+        .getClients()
+        .some((c) => c.clientId === "admin")
+    ).toBe(true);
+    handleClose(ws2, server);
+    const last = lastOf(liveStateBroadcasts())!;
+    if (last.event.type !== "LIVE_STREAM_STATE") throw new Error("unreachable");
+    expect(last.event.stream).toBeNull();
+  });
+
+  it("closing the current socket still removes the client", () => {
+    handleClose(otherWs, server);
+    expect(
+      room()
+        .getClients()
+        .some((c) => c.clientId === "other")
+    ).toBe(false);
   });
 
   it("rejects START from a client without playback permission", async () => {

@@ -470,6 +470,11 @@ export class RoomManager {
   /**
    * Remove a client from the room
    */
+  /** True when ws is the latest socket registered for this client (a reconnect replaces it). */
+  isCurrentConnection(clientId: string, ws: ServerWebSocket<WSData>): boolean {
+    return this.wsConnections.get(clientId) === ws;
+  }
+
   removeClient(clientId: string): void {
     // Only remove from wsConnections, keep clientData for rejoin scenarios
     this.wsConnections.delete(clientId);
