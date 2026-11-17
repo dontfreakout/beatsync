@@ -15,7 +15,10 @@ pub enum EncoderError {
     /// `channels` is not 1 or 2.
     UnsupportedChannels(u8),
     /// The input block does not hold exactly `FRAME_SAMPLES × channels` samples.
-    WrongLength { expected: usize, actual: usize },
+    WrongLength {
+        expected: usize,
+        actual: usize,
+    },
     Opus(opus::Error),
 }
 
@@ -24,7 +27,10 @@ impl fmt::Display for EncoderError {
         match self {
             Self::UnsupportedChannels(n) => write!(f, "unsupported channel count {n}"),
             Self::WrongLength { expected, actual } => {
-                write!(f, "wrong block length: expected {expected} samples, got {actual}")
+                write!(
+                    f,
+                    "wrong block length: expected {expected} samples, got {actual}"
+                )
             }
             Self::Opus(e) => write!(f, "opus error: {e}"),
         }
@@ -62,14 +68,21 @@ impl OpusFrameEncoder {
         let mut encoder = Encoder::new(SAMPLE_RATE, layout, Application::Audio)?;
         encoder.set_bitrate(Bitrate::Bits(BITRATE_BPS))?;
         let lookahead = encoder.get_lookahead()?.max(0) as u32;
-        Ok(Self { encoder, channels: usize::from(channels), lookahead })
+        Ok(Self {
+            encoder,
+            channels: usize::from(channels),
+            lookahead,
+        })
     }
 
     /// Encodes exactly `FRAME_SAMPLES × channels` interleaved samples into one Opus packet.
     pub fn encode(&mut self, interleaved: &[f32]) -> Result<Vec<u8>, EncoderError> {
         let expected = FRAME_SAMPLES * self.channels;
         if interleaved.len() != expected {
-            return Err(EncoderError::WrongLength { expected, actual: interleaved.len() });
+            return Err(EncoderError::WrongLength {
+                expected,
+                actual: interleaved.len(),
+            });
         }
         let mut out = vec![0u8; MAX_PACKET_BYTES];
         let len = self.encoder.encode_float(interleaved, &mut out)?;
@@ -127,9 +140,15 @@ mod tests {
         let mut enc = OpusFrameEncoder::new(2).unwrap();
         assert!(matches!(
             enc.encode(&vec![0.0; FRAME_SAMPLES]),
-            Err(EncoderError::WrongLength { expected: 1920, actual: 960 })
+            Err(EncoderError::WrongLength {
+                expected: 1920,
+                actual: 960
+            })
         ));
-        assert!(matches!(OpusFrameEncoder::new(3), Err(EncoderError::UnsupportedChannels(3))));
+        assert!(matches!(
+            OpusFrameEncoder::new(3),
+            Err(EncoderError::UnsupportedChannels(3))
+        ));
     }
 
     #[test]

@@ -119,7 +119,12 @@ mod tests {
     /// Measurement with a chosen rtt and offset (symmetric legs, no server delay).
     fn with(rtt: f64, offset: f64) -> NtpMeasurement {
         let t0 = 1000.0;
-        m(t0, t0 + rtt / 2.0 + offset, t0 + rtt / 2.0 + offset, t0 + rtt)
+        m(
+            t0,
+            t0 + rtt / 2.0 + offset,
+            t0 + rtt / 2.0 + offset,
+            t0 + rtt,
+        )
     }
 
     #[test]
@@ -132,9 +137,15 @@ mod tests {
     #[test]
     fn impure_pair_is_rejected() {
         let mut v = ProbePairValidator::default();
-        assert!(v.on_response(m(1000.0, 1500.0, 1500.0, 1020.0), 7, 0).is_none());
+        assert!(
+            v.on_response(m(1000.0, 1500.0, 1500.0, 1020.0), 7, 0)
+                .is_none()
+        );
         // client gap 25 ms, server gap 40 ms
-        assert!(v.on_response(m(1025.0, 1540.0, 1540.0, 1045.0), 7, 1).is_none());
+        assert!(
+            v.on_response(m(1025.0, 1540.0, 1540.0, 1045.0), 7, 1)
+                .is_none()
+        );
     }
 
     #[test]
@@ -156,9 +167,15 @@ mod tests {
     fn mismatched_group_is_rejected() {
         let mut v = ProbePairValidator::default();
         v.on_response(m(1000.0, 1500.0, 1500.0, 1020.0), 1, 0);
-        assert!(v.on_response(m(1025.0, 1525.0, 1525.0, 1045.0), 2, 1).is_none());
+        assert!(
+            v.on_response(m(1025.0, 1525.0, 1525.0, 1045.0), 2, 1)
+                .is_none()
+        );
         // pending was cleared
-        assert!(v.on_response(m(1025.0, 1525.0, 1525.0, 1045.0), 1, 1).is_none());
+        assert!(
+            v.on_response(m(1025.0, 1525.0, 1525.0, 1045.0), 1, 1)
+                .is_none()
+        );
     }
 
     #[test]

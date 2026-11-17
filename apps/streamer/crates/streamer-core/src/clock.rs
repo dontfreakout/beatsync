@@ -5,7 +5,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Nanoseconds on `CLOCK_MONOTONIC`.
 #[allow(clippy::useless_conversion)] // the timespec fields are i32 on 32-bit targets
 pub fn mono_ns() -> i64 {
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
     // SAFETY: `ts` is a valid, writable timespec and CLOCK_MONOTONIC is always supported.
     let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
     debug_assert_eq!(rc, 0);
@@ -14,7 +17,9 @@ pub fn mono_ns() -> i64 {
 
 /// Milliseconds since the Unix epoch, from the system clock.
 pub fn epoch_ms() -> f64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64() * 1000.0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64() * 1000.0)
 }
 
 /// A pair (monotonic ns, epoch ms) taken at the same moment.
@@ -36,7 +41,13 @@ impl MonoEpochMap {
             let width = after - before;
             if best.is_none_or(|(w, _)| width < w) {
                 let mid = before + width / 2;
-                best = Some((width, Self { mono_ns: mid, epoch_ms: epoch }));
+                best = Some((
+                    width,
+                    Self {
+                        mono_ns: mid,
+                        epoch_ms: epoch,
+                    },
+                ));
             }
         }
         best.expect("16 iterations").1

@@ -16,7 +16,15 @@ pub struct CaptureTimeline {
 
 impl CaptureTimeline {
     pub fn new(frame_ms: f64, alpha: f64, reanchor_ms: f64) -> Self {
-        Self { frame_ms, alpha, reanchor_ms, base: 0.0, n: 0, off: 0.0, started: false }
+        Self {
+            frame_ms,
+            alpha,
+            reanchor_ms,
+            base: 0.0,
+            n: 0,
+            off: 0.0,
+            started: false,
+        }
     }
 
     /// Returns the smoothed timestamp for the next block. Call once per block, in order.

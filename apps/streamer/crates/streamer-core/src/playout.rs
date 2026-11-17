@@ -535,7 +535,11 @@ mod tests {
         };
         let played = run(&mut p, &mut src, FRAMES, 5, feed, check);
         for (k, &f) in played.iter().enumerate() {
-            let want = if (2880..3072).contains(&k) { None } else { Some(k as u64) };
+            let want = if (2880..3072).contains(&k) {
+                None
+            } else {
+                Some(k as u64)
+            };
             assert_eq!(f, want, "output frame {k}");
         }
     }
@@ -556,7 +560,11 @@ mod tests {
         };
         let played = run(&mut p, &mut src, FRAMES, 4, |_, _| {}, check);
         for (k, &f) in played.iter().enumerate() {
-            let want = if (1920..2880).contains(&k) { None } else { Some(k as u64) };
+            let want = if (1920..2880).contains(&k) {
+                None
+            } else {
+                Some(k as u64)
+            };
             assert_eq!(f, want, "output frame {k}");
         }
         assert_eq!(silent, 960);
@@ -584,7 +592,11 @@ mod tests {
         };
         let played = run(&mut p, &mut src, FRAMES, 10, feed, check);
         for (k, &f) in played.iter().enumerate() {
-            let want = if (2880..7680).contains(&k) { None } else { Some(k as u64) };
+            let want = if (2880..7680).contains(&k) {
+                None
+            } else {
+                Some(k as u64)
+            };
             assert_eq!(f, want, "output frame {k}");
         }
         assert_eq!(silent, 7680 - 2880);
