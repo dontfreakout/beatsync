@@ -24,6 +24,8 @@ export type Phase = "idle" | "starting" | { streaming: { streamId: number } };
 export interface Status {
   connected: boolean;
   synced: boolean;
+  /** Synced at least once on this connection; a start before that has no local copy. */
+  syncedOnce: boolean;
   rttMs: number | null;
   listeners: number;
   phase: Phase;

@@ -14,8 +14,9 @@ use tauri::{AppHandle, ExitRequestApi, Manager, RunEvent};
 use commands::AppState;
 
 /// The exit cleanup gives up after this long (a hung audio backend). PipeWire then removes the
-/// sink with the process, and WirePlumber moves the streams back.
-const EXIT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
+/// sink with the process, and WirePlumber moves the streams back. Above the core's worst case
+/// of about 12 s: a start in progress, a queued app update and the stop, up to 4 s each.
+const EXIT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub fn run() {
     let app = tauri::Builder::default()

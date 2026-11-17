@@ -24,6 +24,7 @@ const MAX_DELAY_MS = 5000;
 const INITIAL_STATUS: Status = {
   connected: false,
   synced: false,
+  syncedOnce: false,
   rttMs: null,
   listeners: 0,
   phase: "idle",
@@ -236,7 +237,9 @@ export function App() {
   const idle = isIdle(status.phase);
   const editable = idle && draft !== null;
   const roomSet = settings !== null && settings.roomId !== "" && settings.username !== "";
-  const canStart = idle && !busy && roomSet && appsError === null && selected.length > 0;
+  // Before the first sync the server offset can be unknown: a start would mute the apps
+  // without a local copy. The status line says "Not connected" or "Syncing…" meanwhile.
+  const canStart = idle && !busy && roomSet && appsError === null && selected.length > 0 && status.syncedOnce;
 
   return (
     <main className="app">
@@ -303,6 +306,7 @@ export function App() {
               onBlur={() => void commit()}
               onKeyDown={commitOnEnter}
             />
+            <span>negative = earlier</span>
           </label>
         </div>
       </section>

@@ -8,6 +8,7 @@
 use std::fmt::Write as _;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Parser;
 use tokio::signal::unix::{SignalKind, signal};
@@ -49,6 +50,9 @@ struct Args {
 }
 
 const USAGE_ERROR: u8 = 2;
+/// The stream starts only once synced; without a sync this long after the start, a line says
+/// why nothing happens yet.
+const SYNC_NOTICE_AFTER: Duration = Duration::from_secs(2);
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -200,10 +204,19 @@ async fn stream(settings: Settings, backend: Arc<dyn AudioBackend>) -> ExitCode 
 
     let mut last = status_line(&status.borrow_and_update());
     println!("{last}");
+    let sync_notice = tokio::time::sleep(SYNC_NOTICE_AFTER);
+    tokio::pin!(sync_notice);
+    let mut sync_notice_due = true;
     loop {
         tokio::select! {
             _ = sigint.recv() => break,
             _ = sigterm.recv() => break,
+            _ = &mut sync_notice, if sync_notice_due => {
+                sync_notice_due = false;
+                if !status.borrow().synced_once {
+                    eprintln!("beatsync-streamer: waiting for sync with the server");
+                }
+            }
             changed = status.changed() => {
                 if changed.is_err() {
                     // No engine (invalid server URL): the last status says why.

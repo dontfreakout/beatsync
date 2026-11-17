@@ -270,6 +270,7 @@ fn idle_status() -> Status {
     Status {
         connected: false,
         synced: false,
+        synced_once: false,
         rtt_ms: None,
         listeners: 0,
         phase: Phase::Idle,

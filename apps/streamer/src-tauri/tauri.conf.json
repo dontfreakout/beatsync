@@ -24,6 +24,7 @@
   },
   "bundle": {
     "active": true,
+    "category": "Music",
     "targets": ["rpm", "deb", "appimage"],
     "linux": {
       "rpm": { "depends": ["pipewire"] },

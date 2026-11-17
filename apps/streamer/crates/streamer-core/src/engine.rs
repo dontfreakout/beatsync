@@ -97,6 +97,10 @@ pub enum Output {
 pub struct Status {
     pub connected: bool,
     pub synced: bool,
+    /// Synced at least once since this engine was created (a disconnect or a clock step does
+    /// not clear it). Until then the server offset may be unknown, and a start would mute the
+    /// apps without a local copy.
+    pub synced_once: bool,
     pub rtt_ms: Option<f64>,
     pub listeners: usize,
     pub phase: Phase,
@@ -128,6 +132,7 @@ pub struct Engine {
     /// When the next probe pair is due; `None`: on the next tick.
     next_probe_ms: Option<f64>,
     last_offset_ms: Option<f64>,
+    synced_once: bool,
     phase: Phase,
     /// The selected apps; every START and UPDATE label is built from them.
     apps: Vec<String>,
@@ -160,6 +165,7 @@ impl Engine {
             first_valid_group_id: 0,
             next_probe_ms: None,
             last_offset_ms: None,
+            synced_once: false,
             phase: Phase::Idle,
             apps: Vec::new(),
             delay_ms: 0,
@@ -476,9 +482,11 @@ impl Engine {
     }
 
     fn emit_status(&mut self, out: &mut Vec<Output>) {
+        self.synced_once |= self.estimator.is_synced();
         let status = Status {
             connected: self.connected,
             synced: self.estimator.is_synced(),
+            synced_once: self.synced_once,
             rtt_ms: self.estimator.avg_rtt_ms(),
             listeners: self
                 .clients
@@ -874,6 +882,7 @@ mod tests {
         let out = h.feed(Input::ClockStepped { delta_ms: 1000.0 });
         assert_eq!(offsets(&out), vec![-500.0], "server time stays continuous");
         assert!(!h.status().synced);
+        assert!(h.status().synced_once, "the offset is still known");
         assert_eq!(h.phase(), Phase::Streaming { stream_id: 3 });
         assert_eq!(frames(&h.feed(block(0.0))), vec![frame(3, 0, 0.0)]);
         // The pair sent before the step was measured across it.
@@ -1090,6 +1099,10 @@ mod tests {
         assert_eq!(h.phase(), Phase::Starting);
         assert!(!h.status().connected);
         assert!(!h.status().synced);
+        assert!(
+            h.status().synced_once,
+            "a start may go on: the offset is known"
+        );
         let out = h.feed(block(40.0));
         assert!(frames(&out).is_empty(), "no frames while disconnected");
         all.extend(out);
@@ -1211,6 +1224,7 @@ mod tests {
         let first = Status {
             connected: false,
             synced: false,
+            synced_once: false,
             rtt_ms: None,
             listeners: 0,
             phase: Phase::Idle,
