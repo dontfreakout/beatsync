@@ -29,7 +29,8 @@ pub struct PlayoutConfig {
     pub sample_rate: f64,
     /// Larger errors flush and restart at the ideal time.
     pub resync_ms: f64,
-    /// Larger errors (up to `resync_ms`) are corrected gradually.
+    /// Larger errors (up to `resync_ms`) are corrected gradually. A larger step between the end
+    /// of one block and the start of the next resyncs at the block boundary.
     pub correction_threshold_ms: f64,
     /// While correcting, one source frame is skipped or repeated per this many output frames.
     pub correction_interval_frames: usize,
@@ -79,8 +80,8 @@ enum Correction {
 
 /// Plays [`PcmBlock`]s back to back from a cursor (head block + frame index) and keeps the
 /// cursor at the time the output is heard: small errors are corrected gradually; large errors,
-/// timestamp jumps between blocks and the end of an underrun resync. Real-time safe: `fill` does
-/// not allocate, lock or panic.
+/// timestamp steps between blocks (above the correction threshold) and the end of an underrun
+/// resync. Real-time safe: `fill` does not allocate, lock or panic.
 pub struct Playout {
     frame_ms: f64,
     resync_ms: f64,
@@ -231,8 +232,8 @@ impl Playout {
 
     /// Plays the cursor back to back into output frames `pos..`, with one skip or repeat per
     /// `interval` frames if correcting. Pops each block after its last frame. A next block that
-    /// starts more than `resync_ms` away from the end of the previous one (capture re-anchor)
-    /// resyncs at once, so it is never heard early.
+    /// starts more than `correction_threshold_ms` away from the end of the previous one (lost
+    /// block, capture re-anchor) resyncs at once, so it is never heard early.
     fn play(
         &mut self,
         out: &mut [f32],
@@ -279,7 +280,7 @@ impl Playout {
             index -= FRAME_SAMPLES;
             src.pop();
             if let Some(next) = src.peek()
-                && (next.target_start_server_ms - end_ms).abs() > self.resync_ms
+                && (next.target_start_server_ms - end_ms).abs() > self.threshold_ms
             {
                 correction = Correction::None;
                 let at = heard_at + pos as f64 * self.frame_ms;
@@ -537,6 +538,28 @@ mod tests {
             let want = if (2880..3072).contains(&k) { None } else { Some(k as u64) };
             assert_eq!(f, want, "output frame {k}");
         }
+    }
+
+    #[test]
+    fn single_missing_block_leaves_a_silent_gap() {
+        // Block 2 is lost: the step from the end of block 1 to block 3 is exactly 20 ms. Output
+        // frames 1920..2880 (block 2's slot) are silent and block 3 starts exactly at its
+        // target, output frame 2880; none of its frames plays earlier.
+        const FRAMES: usize = 1024;
+        let mut p = playout();
+        let blocks = [0, 1, 3, 4].map(|n| block(n, T0 + 20.0 * n as f64));
+        let mut src = Queue(VecDeque::from(blocks));
+        let mut silent = 0;
+        let check = |call: usize, s: FillStats, _: &Playout| {
+            assert_eq!(s.resynced, call == 0 || call == 1, "call {call}");
+            silent += s.silent_frames;
+        };
+        let played = run(&mut p, &mut src, FRAMES, 4, |_, _| {}, check);
+        for (k, &f) in played.iter().enumerate() {
+            let want = if (1920..2880).contains(&k) { None } else { Some(k as u64) };
+            assert_eq!(f, want, "output frame {k}");
+        }
+        assert_eq!(silent, 960);
     }
 
     #[test]
