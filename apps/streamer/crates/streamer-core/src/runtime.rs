@@ -729,10 +729,13 @@ impl BlockAssembler {
         }
     }
 
-    /// The chunk does not continue the previous one (lost audio or a capture restart).
+    /// The chunk does not continue the previous one: audio was lost before it, or its time
+    /// does not follow (a capture restart).
     fn is_gap(&self, chunk: &CapturedChunk) -> bool {
-        self.next_ns
-            .is_some_and(|next| (chunk.mono_ns_first_frame - next).abs() > CAPTURE_GAP_NS)
+        chunk.after_loss
+            || self
+                .next_ns
+                .is_some_and(|next| (chunk.mono_ns_first_frame - next).abs() > CAPTURE_GAP_NS)
     }
 
     /// Forgets the partial block and the expected next chunk.
@@ -779,6 +782,7 @@ mod tests {
             mono_ns_first_frame: mono_ns,
             frames,
             samples: [0.0; CHUNK_MAX_FRAMES * 2],
+            after_loss: false,
         };
         for i in 0..frames {
             let v = (first_frame + i) as f32;
@@ -826,5 +830,19 @@ mod tests {
         blocks.clear();
         asm.push(&c, |first_ns, s| blocks.push((first_ns, s[0], 0.0)));
         assert_eq!(blocks, vec![(resume_ns, 0.0, 0.0)]);
+    }
+
+    #[test]
+    fn a_chunk_after_lost_audio_is_a_gap() {
+        // One lost 1024-frame chunk moves the next chunk by only 21 ms. Without the mark the
+        // assembler joins audio across the hole, and the timeline stamps the following
+        // blocks up to 21 ms early for seconds.
+        let mut asm = BlockAssembler::new();
+        let t0 = 7_000_000_000_i64;
+        asm.push(&chunk(t0, 0, 1024), |_, _| {});
+        let mut next = chunk(t0 + frames_to_ns(2 * 1024), 2 * 1024, 1024);
+        assert!(!asm.is_gap(&next), "too short for the time check");
+        next.after_loss = true;
+        assert!(asm.is_gap(&next));
     }
 }

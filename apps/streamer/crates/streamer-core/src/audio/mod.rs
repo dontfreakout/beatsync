@@ -79,6 +79,9 @@ pub struct CapturedChunk {
     /// Valid stereo frames in `samples` (at most [`CHUNK_MAX_FRAMES`]).
     pub frames: usize,
     pub samples: [f32; CHUNK_MAX_FRAMES * 2],
+    /// Captured audio was lost just before this chunk (a full ring or no timing). A lost
+    /// chunk can be shorter than any time-based gap check.
+    pub after_loss: bool,
 }
 
 /// Values the runtime updates and the real-time playback callback reads.
