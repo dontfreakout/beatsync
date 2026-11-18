@@ -48,8 +48,13 @@ const CAPTURE_RING: usize = 384;
 const PLAYOUT_RING: usize = 512;
 const TIMELINE_ALPHA: f64 = 0.002;
 const TIMELINE_REANCHOR_MS: f64 = 50.0;
-/// A larger jump between consecutive chunks restarts the block and the timeline.
+/// A chunk that starts further than this from the end of the previous chunk and the lost
+/// frames restarts the block and the timeline (a capture restart).
 const CAPTURE_GAP_NS: i64 = 50_000_000;
+/// A shorter loss of captured audio plays as silence. A longer loss restarts the block and the
+/// timeline: the timestamps then step by far more than the 50 ms at which the web receiver
+/// resyncs, so every device resyncs, and no burst of silent blocks goes out.
+const MAX_SILENT_FILL_NS: i64 = 200_000_000;
 /// The worker sleeps this long when the capture ring is empty.
 const WORKER_IDLE: Duration = Duration::from_millis(5);
 /// At shutdown, how long queued messages (e.g. STOP_LIVE_STREAM) may take to go out.
@@ -729,13 +734,14 @@ impl BlockAssembler {
         }
     }
 
-    /// The chunk does not continue the previous one: audio was lost before it, or its time
-    /// does not follow (a capture restart).
+    /// The chunk does not continue the previous one: too much audio was lost before it, or
+    /// its time does not follow the previous chunk and the lost frames (a capture restart).
     fn is_gap(&self, chunk: &CapturedChunk) -> bool {
-        chunk.after_loss
-            || self
-                .next_ns
-                .is_some_and(|next| (chunk.mono_ns_first_frame - next).abs() > CAPTURE_GAP_NS)
+        frames_to_ns(chunk.lost_frames) > MAX_SILENT_FILL_NS
+            || self.next_ns.is_some_and(|next| {
+                let expected_ns = next + frames_to_ns(chunk.lost_frames);
+                (chunk.mono_ns_first_frame - expected_ns).abs() > CAPTURE_GAP_NS
+            })
     }
 
     /// Forgets the partial block and the expected next chunk.
@@ -744,17 +750,40 @@ impl BlockAssembler {
         self.next_ns = None;
     }
 
+    /// Adds the chunk. If it continues the previous chunk, silence comes first in place of the
+    /// lost frames: the timestamps stay continuous, and every device plays the same silence.
+    /// Check [`Self::is_gap`] first.
     fn push(&mut self, chunk: &CapturedChunk, mut emit: impl FnMut(i64, &[f32; BLOCK_SAMPLES])) {
+        if let Some(next) = self.next_ns {
+            self.append(next, None, chunk.lost_frames, &mut emit);
+        }
         let frames = chunk.frames.min(CHUNK_MAX_FRAMES);
+        let samples = &chunk.samples[..frames * CHANNELS];
+        self.append(chunk.mono_ns_first_frame, Some(samples), frames, &mut emit);
         self.next_ns = Some(chunk.mono_ns_first_frame + frames_to_ns(frames));
+    }
+
+    /// Adds `frames` frames that start at `start_ns`: from `samples`, or silence for `None`.
+    fn append(
+        &mut self,
+        start_ns: i64,
+        samples: Option<&[f32]>,
+        frames: usize,
+        emit: &mut impl FnMut(i64, &[f32; BLOCK_SAMPLES]),
+    ) {
         let mut index = 0;
         while index < frames {
             if self.filled == 0 {
-                self.first_ns = chunk.mono_ns_first_frame + frames_to_ns(index);
+                self.first_ns = start_ns + frames_to_ns(index);
             }
             let take = (FRAME_SAMPLES - self.filled).min(frames - index);
-            self.samples[self.filled * CHANNELS..(self.filled + take) * CHANNELS]
-                .copy_from_slice(&chunk.samples[index * CHANNELS..(index + take) * CHANNELS]);
+            let to = &mut self.samples[self.filled * CHANNELS..(self.filled + take) * CHANNELS];
+            match samples {
+                Some(from) => {
+                    to.copy_from_slice(&from[index * CHANNELS..(index + take) * CHANNELS]);
+                }
+                None => to.fill(0.0),
+            }
             self.filled += take;
             index += take;
             if self.filled == FRAME_SAMPLES {
@@ -782,7 +811,7 @@ mod tests {
             mono_ns_first_frame: mono_ns,
             frames,
             samples: [0.0; CHUNK_MAX_FRAMES * 2],
-            after_loss: false,
+            lost_frames: 0,
         };
         for i in 0..frames {
             let v = (first_frame + i) as f32;
@@ -822,7 +851,8 @@ mod tests {
             );
         }
 
-        // 100 ms of lost audio: the partial block is dropped, the next block starts after it.
+        // A 100 ms jump with no lost frames counted (a capture restart): the partial block is
+        // dropped, the next block starts after it.
         let resume_ns = t0 + frames_to_ns(15 * 1024) + 100_000_000;
         let c = chunk(resume_ns, 0, 1024);
         assert!(asm.is_gap(&c));
@@ -833,16 +863,54 @@ mod tests {
     }
 
     #[test]
-    fn a_chunk_after_lost_audio_is_a_gap() {
-        // One lost 1024-frame chunk moves the next chunk by only 21 ms. Without the mark the
-        // assembler joins audio across the hole, and the timeline stamps the following
-        // blocks up to 21 ms early for seconds.
+    fn a_long_loss_is_a_gap() {
+        // Filled, a long loss goes out as a burst of silent blocks. A restart steps the
+        // timestamps by far more than 50 ms, so every device resyncs.
         let mut asm = BlockAssembler::new();
         let t0 = 7_000_000_000_i64;
         asm.push(&chunk(t0, 0, 1024), |_, _| {});
-        let mut next = chunk(t0 + frames_to_ns(2 * 1024), 2 * 1024, 1024);
-        assert!(!asm.is_gap(&next), "too short for the time check");
-        next.after_loss = true;
-        assert!(asm.is_gap(&next));
+        // 213 ms lost, and the time of the next chunk agrees.
+        let mut resumed = chunk(t0 + frames_to_ns(11 * 1024), 11 * 1024, 1024);
+        resumed.lost_frames = 10 * 1024;
+        assert!(asm.is_gap(&resumed));
+    }
+
+    #[test]
+    fn lost_audio_becomes_silence_in_time() {
+        // The web receiver plays consecutive sequence numbers back to back through any
+        // timestamp step below 50 ms, but the local copy resyncs on a step above 0.5 ms. So a
+        // short loss must not step the timestamps: both play the lost frames as silence.
+        let mut asm = BlockAssembler::new();
+        let t0 = 7_000_000_000_i64;
+        // Frames 1024..4096 (64 ms) are lost, more than the 50 ms time check.
+        let mut resumed = chunk(t0 + frames_to_ns(4 * 1024), 4 * 1024, 1024);
+        resumed.lost_frames = 3 * 1024;
+        let chunks = [
+            chunk(t0, 0, 1024),
+            resumed,
+            chunk(t0 + frames_to_ns(5 * 1024), 5 * 1024, 1024),
+        ];
+        let mut blocks: Vec<i64> = Vec::new();
+        let mut left: Vec<f32> = Vec::new();
+        for c in &chunks {
+            assert!(!asm.is_gap(c), "chunk at frame {}", c.samples[0]);
+            asm.push(c, |first_ns, s| {
+                blocks.push(first_ns);
+                left.extend(s.iter().step_by(CHANNELS));
+            });
+        }
+        assert_eq!(blocks.len(), 6 * 1024 / FRAME_SAMPLES);
+        for (k, &first_ns) in blocks.iter().enumerate() {
+            let expected_ns = t0 + frames_to_ns(k * FRAME_SAMPLES);
+            assert!((first_ns - expected_ns).abs() <= 1, "block {k}");
+        }
+        for (k, &v) in left.iter().enumerate() {
+            let want = if (1024..4 * 1024).contains(&k) {
+                0.0
+            } else {
+                k as f32
+            };
+            assert_eq!(v, want, "frame {k}");
+        }
     }
 }
