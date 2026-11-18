@@ -6,6 +6,11 @@ import type { HandlerFunction } from "@/websocket/types";
 export const handlePlay: HandlerFunction<ExtractWSRequestFrom["PLAY"]> = ({ ws, message, server }) => {
   const { room } = requireCanMutate(ws);
 
+  if (room.getLiveStream()) {
+    console.warn(`Play refused in room ${ws.data.roomId} - a live stream is active`);
+    return;
+  }
+
   if (IS_DEMO_MODE) {
     // Skip audio loading coordination — audio is pre-cached on clients.
     // Broadcast play immediately to avoid 3s timeout dead air on stage.

@@ -12,12 +12,14 @@ import type {
   ChatMessageType,
   ClientDataType,
   DiscoveryRoomType,
+  LiveStreamType,
   PauseActionType,
   PlayActionType,
   PlaybackControlsPermissionsEnum,
   PlaybackControlsPermissionsType,
   PositionType,
   RoomType,
+  StartLiveStreamType,
   WSBroadcastType,
 } from "@beatsync/shared";
 import { ChatMessageSchema, ClientDataSchema, epochNow, LOW_PASS_CONSTANTS, NTP_CONSTANTS } from "@beatsync/shared";
@@ -127,6 +129,9 @@ export class RoomManager {
   private activeStreamJobs = new Map<string, { status: string }>();
   private chatManager: ChatManager;
   private serverRef?: BunServer;
+  // Live stream state is ephemeral: not part of createBackup()
+  private liveStream?: { state: LiveStreamType; server: BunServer };
+  private nextLiveStreamId = 1; // never reused during the room's lifetime
 
   // Audio loading state for synchronized playback
   private pendingPlay?: PendingPlayState;
@@ -214,13 +219,14 @@ export class RoomManager {
       return false;
     }
 
-    const clientCount = this.getClients().length;
-    // Don't start playback if there are no clients
-    if (clientCount === 0) {
+    // Streamer clients never load queue tracks, so only web clients are waited for
+    const webClients = this.getClients().filter((client) => client.kind === "web");
+    // Don't start playback if there are no web clients
+    if (webClients.length === 0) {
       return false;
     }
 
-    return this.pendingPlay.clientsLoaded.size === clientCount;
+    return webClients.every((client) => this.pendingPlay?.clientsLoaded.has(client.clientId));
   }
 
   /**
@@ -313,6 +319,89 @@ export class RoomManager {
     return this.playbackState;
   }
 
+  getLiveStream(): LiveStreamType | null {
+    return this.liveStream?.state ?? null;
+  }
+
+  /**
+   * Start a live stream from a source client. Replaces any active stream, cancels
+   * a pending play and pauses a playing queue at its current position.
+   */
+  startLiveStream({
+    sourceClientId,
+    request,
+    server,
+  }: {
+    sourceClientId: string;
+    request: StartLiveStreamType;
+    server: BunServer;
+  }): LiveStreamType {
+    this.clearAudioLoadingState();
+    this.pauseQueueForLiveStream(server);
+
+    const state: LiveStreamType = {
+      streamId: this.nextLiveStreamId++,
+      sourceClientId,
+      sourceUsername: this.clientData.get(sourceClientId)?.username ?? "",
+      label: request.label,
+      codec: request.codec,
+      sampleRate: request.sampleRate,
+      channels: request.channels,
+      frameDurationMs: request.frameDurationMs,
+      delayMs: request.delayMs,
+      startedAt: epochNow(),
+    };
+    this.liveStream = { state, server };
+    console.log(`Room ${this.roomId}: live stream ${state.streamId} started by ${sourceClientId}`);
+    this.broadcastLiveStreamState();
+    return state;
+  }
+
+  updateLiveStreamLabel(label: string): void {
+    if (!this.liveStream) return;
+    this.liveStream.state = { ...this.liveStream.state, label };
+    this.broadcastLiveStreamState();
+  }
+
+  stopLiveStream(opts: { stoppedByClientId?: string } = {}): void {
+    if (!this.liveStream) return;
+    const { server, state } = this.liveStream;
+    this.liveStream = undefined;
+    console.log(`Room ${this.roomId}: live stream ${state.streamId} stopped`);
+    sendBroadcast({
+      server,
+      roomId: this.roomId,
+      message: {
+        type: "ROOM_EVENT",
+        event: { type: "LIVE_STREAM_STATE", stream: null, stoppedByClientId: opts.stoppedByClientId },
+      },
+    });
+  }
+
+  private broadcastLiveStreamState(): void {
+    if (!this.liveStream) return;
+    sendBroadcast({
+      server: this.liveStream.server,
+      roomId: this.roomId,
+      message: { type: "ROOM_EVENT", event: { type: "LIVE_STREAM_STATE", stream: this.liveStream.state } },
+    });
+  }
+
+  private pauseQueueForLiveStream(server: BunServer): void {
+    const { playbackState } = this;
+    if (playbackState.type !== "playing") return;
+    const serverTimeToExecute = this.getScheduledExecutionTime();
+    const trackTimeSeconds =
+      playbackState.trackPositionSeconds + (serverTimeToExecute - playbackState.serverTimeToExecute) / 1000;
+    const pause: PauseActionType = { type: "PAUSE", audioSource: playbackState.audioSource, trackTimeSeconds };
+    this.updatePlaybackSchedulePause(pause, serverTimeToExecute);
+    sendBroadcast({
+      server,
+      roomId: this.roomId,
+      message: { type: "SCHEDULED_ACTION", scheduledAction: pause, serverTimeToExecute },
+    });
+  }
+
   /**
    * Add a client to the room
    */
@@ -329,6 +418,7 @@ export class RoomManager {
       clientId,
       isAdmin: false,
       isCreator: ws.data.isCreator,
+      kind: ws.data.kind,
       rtt: 0,
       compensationMs: 0,
       nudgeMs: 0,
@@ -350,9 +440,14 @@ export class RoomManager {
       clientData.nudgeMs = cachedClient.nudgeMs;
     }
 
-    // In demo mode, only the admin secret grants admin. Otherwise, first client gets admin.
-    if (!IS_DEMO_MODE && this.wsConnections.size === 0) {
-      clientData.isAdmin = true;
+    // In demo mode, only the admin secret grants admin. Otherwise the first connection gets admin, and a web client
+    // also gets admin when no other connected web client is admin (a streamer may hold admin but has no admin UI).
+    if (!IS_DEMO_MODE) {
+      const firstConnection = this.wsConnections.size === 0;
+      const noWebAdmin = !this.getClients().some((client) => client.kind === "web" && client.isAdmin);
+      if (firstConnection || (clientData.kind === "web" && noWebAdmin)) {
+        clientData.isAdmin = true;
+      }
     }
 
     // If the client authenticated with the admin secret or is the creator, always grant admin
@@ -375,9 +470,17 @@ export class RoomManager {
   /**
    * Remove a client from the room
    */
+  /** True when ws is the latest socket registered for this client (a reconnect replaces it). */
+  isCurrentConnection(clientId: string, ws: ServerWebSocket<WSData>): boolean {
+    return this.wsConnections.get(clientId) === ws;
+  }
+
   removeClient(clientId: string): void {
     // Only remove from wsConnections, keep clientData for rejoin scenarios
     this.wsConnections.delete(clientId);
+    if (this.liveStream?.state.sourceClientId === clientId) {
+      this.stopLiveStream();
+    }
     if (this.demoAudioReadyClients.delete(clientId)) {
       this.debouncedAudioReady();
     }
@@ -391,12 +494,14 @@ export class RoomManager {
       // Check if any admins remain after removing this client
       // In demo mode, skip auto-promotion — only the admin secret grants admin
       if (!IS_DEMO_MODE) {
-        const remainingAdmins = activeClients.filter((client) => client.isAdmin);
+        // Streamers are never promoted and do not count: they have no admin UI
+        const webClients = activeClients.filter((client) => client.kind === "web");
+        const remainingAdmins = webClients.filter((client) => client.isAdmin);
 
-        if (remainingAdmins.length === 0) {
+        if (webClients.length > 0 && remainingAdmins.length === 0) {
           // Promote the most recently active client — promoting a backgrounded
           // lurker could leave a room where nobody present can control playback
-          const newAdmin = activeClients.reduce((a, b) => (a.lastSeenAt >= b.lastSeenAt ? a : b));
+          const newAdmin = webClients.reduce((a, b) => (a.lastSeenAt >= b.lastSeenAt ? a : b));
 
           newAdmin.isAdmin = true;
           this.clientData.set(newAdmin.clientId, newAdmin);

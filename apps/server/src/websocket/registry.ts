@@ -21,6 +21,9 @@ import { handleStopSpatialAudio } from "@/websocket/handlers/stopSpatialAudio";
 import { handleReorderAudioSources } from "@/websocket/handlers/handleReorderAudioSources";
 import { handleSetMetronome } from "@/websocket/handlers/setMetronome";
 import { handleSetLowPassFreq } from "@/websocket/handlers/setLowPassFreq";
+import { handleStartLiveStream } from "@/websocket/handlers/startLiveStream";
+import { handleStopLiveStream } from "@/websocket/handlers/stopLiveStream";
+import { handleUpdateLiveStream } from "@/websocket/handlers/updateLiveStream";
 import { handleSync } from "@/websocket/handlers/sync";
 import type { WebsocketRegistry } from "@/websocket/types";
 
@@ -132,5 +135,17 @@ export const WS_REGISTRY: WebsocketRegistry = {
   [ClientActionEnum.enum.LIVENESS_PONG]: {
     handle: handleLivenessPong,
     description: "Liveness reply to a server LIVENESS_PING",
+  },
+  [ClientActionEnum.enum.START_LIVE_STREAM]: {
+    handle: handleStartLiveStream,
+    description: "Start a live audio stream from this client",
+  },
+  [ClientActionEnum.enum.UPDATE_LIVE_STREAM]: {
+    handle: handleUpdateLiveStream,
+    description: "Update the label of the active live stream (source only)",
+  },
+  [ClientActionEnum.enum.STOP_LIVE_STREAM]: {
+    handle: handleStopLiveStream,
+    description: "Stop the active live stream (source or client with playback permission)",
   },
 };

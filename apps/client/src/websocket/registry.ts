@@ -1,5 +1,6 @@
 import { useChatStore } from "@/store/chat";
 import { useGlobalStore } from "@/store/global";
+import { useLiveStreamStore } from "@/store/liveStream";
 import { getProbeStats, handleNTPResponse } from "@/utils/ntp";
 import { sendWSRequest } from "@/utils/ws";
 import { ClientActionEnum, ServerActionEnum, type ExtractWSResponseFrom } from "@beatsync/shared";
@@ -25,6 +26,9 @@ const ROOM_EVENT_REGISTRY: {
   },
   LOAD_AUDIO_SOURCE: (event) => {
     useGlobalStore.getState().handleLoadAudioSource(event);
+  },
+  LIVE_STREAM_STATE: (event) => {
+    useLiveStreamStore.getState().setStream(event.stream);
   },
 };
 
@@ -76,6 +80,14 @@ export const WS_RESPONSE_REGISTRY: WebsocketResponseRegistry = {
       useGlobalStore.getState().sendProbePair();
     },
     description: "Liveness probe; reply with LIVENESS_PONG so the server knows this tab is alive",
+  },
+
+  [ServerActionEnum.enum.LIVE_STREAM_REJECTED]: {
+    handle: ({ response }) => {
+      // Web clients never send START_LIVE_STREAM, so this is informational only.
+      console.warn("Live stream rejected:", response.reason);
+    },
+    description: "A live stream start request was refused",
   },
 
   [ServerActionEnum.enum.NTP_RESPONSE]: {

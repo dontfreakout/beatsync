@@ -17,6 +17,7 @@ describe("Chat Persistence", () => {
       isActive: true,
       isAdmin: false,
       isCreator: false,
+      kind: "web" as const,
       joinedAt: Date.now(),
       rtt: 50,
       compensationMs: 0,

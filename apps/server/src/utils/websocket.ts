@@ -6,6 +6,7 @@ export interface WSData {
   username: string;
   isAdmin: boolean;
   isCreator: boolean;
+  kind: "web" | "streamer";
 }
 
 export type BunServer = Server<WSData>;
