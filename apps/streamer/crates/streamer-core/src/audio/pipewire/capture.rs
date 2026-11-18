@@ -28,8 +28,8 @@ pub(super) struct CaptureState {
     shared: Arc<PlayoutShared>,
     /// Filled in place, then copied into the ring (keeps 8 KiB off the real-time stack).
     chunk: Box<CapturedChunk>,
-    /// Audio was lost since the last chunk that went into the ring.
-    lost: bool,
+    /// Frames lost since the last chunk that went into the ring.
+    lost_frames: usize,
 }
 
 fn capture_properties(target: &str) -> PropertiesBox {
@@ -52,8 +52,8 @@ fn capture_properties(target: &str) -> PropertiesBox {
 }
 
 /// Captures the monitor of the sink with `node.name` = `target` into `tx`. Full ring: the
-/// chunk is dropped and counted in `shared.capture_dropped`, and the next chunk is marked
-/// [`CapturedChunk::after_loss`]. The timestamps assume that the
+/// chunk is dropped and counted in `shared.capture_dropped`, and the next chunk carries the
+/// lost frames in [`CapturedChunk::lost_frames`]. The timestamps assume that the
 /// sink drives its graph, as a null sink does (see [`buffer_starts`]).
 pub(super) fn connect_capture(
     core: &CoreRc,
@@ -76,9 +76,9 @@ pub(super) fn connect_capture(
             mono_ns_first_frame: 0,
             frames: 0,
             samples: [0.0; CHUNK_MAX_FRAMES * 2],
-            after_loss: false,
+            lost_frames: 0,
         }),
-        lost: false,
+        lost_frames: 0,
     };
     media::connect(core, spec, state, process, on_state)
 }
@@ -130,17 +130,19 @@ pub(super) fn emit_chunks(
     }
 }
 
-/// Pushes `chunk` into the ring and marks it when audio was lost before it. A full ring drops
-/// the chunk and counts it. Real-time safe.
+/// Pushes `chunk` into the ring with the frames lost before it. A full ring drops the chunk,
+/// counts it and adds its frames to `lost_frames`. Real-time safe.
 fn push_chunk(
     tx: &mut rtrb::Producer<CapturedChunk>,
     shared: &PlayoutShared,
-    lost: &mut bool,
+    lost_frames: &mut usize,
     chunk: &mut CapturedChunk,
 ) {
-    chunk.after_loss = *lost;
-    *lost = tx.push(*chunk).is_err();
-    if *lost {
+    chunk.lost_frames = *lost_frames;
+    if tx.push(*chunk).is_ok() {
+        *lost_frames = 0;
+    } else {
+        *lost_frames = lost_frames.saturating_add(chunk.frames);
         shared.capture_dropped.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -182,7 +184,8 @@ fn process(stream: &Stream, st: &mut CaptureState) {
         st.shared
             .capture_dropped
             .fetch_add(chunks as u64, Ordering::Relaxed);
-        st.lost |= chunks > 0;
+        let lost: usize = frames[..count].iter().sum();
+        st.lost_frames = st.lost_frames.saturating_add(lost);
         return;
     };
     let mut starts = [0_i64; MAX_HELD];
@@ -195,12 +198,12 @@ fn process(stream: &Stream, st: &mut CaptureState) {
         tx,
         shared,
         chunk,
-        lost,
+        lost_frames,
     } = st;
     for (buffer, &start) in held[..count].iter_mut().zip(&starts[..count]) {
         let Some(buffer) = buffer else { continue };
         emit_chunks(valid_bytes(buffer), start, chunk, |c| {
-            push_chunk(tx, shared, lost, c)
+            push_chunk(tx, shared, lost_frames, c)
         });
     }
     // Dropping `held` gives the buffers back to the stream.
@@ -256,11 +259,11 @@ mod tests {
             mono_ns_first_frame: 0,
             frames: 0,
             samples: [7.0; CHUNK_MAX_FRAMES * 2],
-            after_loss: false,
+            lost_frames: 0,
         };
         let mut got = Vec::new();
         emit_chunks(&bytes, 1_000 * MS, &mut chunk, |c| got.push(*c));
-        assert!(got.iter().all(|c| !c.after_loss));
+        assert!(got.iter().all(|c| c.lost_frames == 0));
         let sizes: Vec<usize> = got.iter().map(|c| c.frames).collect();
         assert_eq!(sizes, [1024, 1024, 452]);
         for (k, c) in got.iter().enumerate() {
@@ -277,28 +280,37 @@ mod tests {
     }
 
     #[test]
-    fn the_chunk_after_a_full_ring_is_marked() {
-        // A dropped 1024-frame chunk is a 21 ms hole, too short for the worker's 50 ms time
-        // check; unmarked, the next block would join audio across the hole.
+    fn the_chunk_after_a_full_ring_counts_the_lost_frames() {
+        // The worker puts this many silent frames in place of the lost audio, so the
+        // timestamps stay continuous. A wrong count plays the later audio at the wrong time.
         let (mut tx, mut rx) = rtrb::RingBuffer::<CapturedChunk>::new(1);
         let shared = PlayoutShared::default();
-        let mut lost = false;
+        let mut lost_frames = 0;
         let mut chunk = CapturedChunk {
             mono_ns_first_frame: 0,
             frames: 1024,
             samples: [0.0; CHUNK_MAX_FRAMES * 2],
-            after_loss: false,
+            lost_frames: 0,
         };
-        push_chunk(&mut tx, &shared, &mut lost, &mut chunk);
-        push_chunk(&mut tx, &shared, &mut lost, &mut chunk); // full: dropped
-        assert_eq!(shared.capture_dropped.load(Ordering::Relaxed), 1);
-        assert!(!rx.pop().unwrap().after_loss);
-        push_chunk(&mut tx, &shared, &mut lost, &mut chunk);
-        assert!(rx.pop().unwrap().after_loss, "the chunk after the drop");
-        push_chunk(&mut tx, &shared, &mut lost, &mut chunk);
-        assert!(
-            !rx.pop().unwrap().after_loss,
-            "the mark is for one chunk only"
+        push_chunk(&mut tx, &shared, &mut lost_frames, &mut chunk);
+        chunk.frames = 512;
+        push_chunk(&mut tx, &shared, &mut lost_frames, &mut chunk); // full: dropped
+        chunk.frames = 256;
+        push_chunk(&mut tx, &shared, &mut lost_frames, &mut chunk); // full: dropped
+        assert_eq!(shared.capture_dropped.load(Ordering::Relaxed), 2);
+        assert_eq!(rx.pop().unwrap().lost_frames, 0);
+        chunk.frames = 1024;
+        push_chunk(&mut tx, &shared, &mut lost_frames, &mut chunk);
+        assert_eq!(
+            rx.pop().unwrap().lost_frames,
+            512 + 256,
+            "the chunk after the drops"
+        );
+        push_chunk(&mut tx, &shared, &mut lost_frames, &mut chunk);
+        assert_eq!(
+            rx.pop().unwrap().lost_frames,
+            0,
+            "counted for one chunk only"
         );
     }
 }
