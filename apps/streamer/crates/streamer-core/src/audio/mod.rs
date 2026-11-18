@@ -84,10 +84,10 @@ pub struct CapturedChunk {
 /// Values the runtime updates and the real-time playback callback reads.
 #[derive(Debug, Default)]
 pub struct PlayoutShared {
-    /// f64 bits: server time minus local clock time, in ms.
-    pub server_offset_ms: AtomicU64,
-    /// f64 bits: local clock time minus CLOCK_MONOTONIC time, in ms.
-    pub mono_epoch_offset_ms: AtomicU64,
+    /// f64 bits: server time minus CLOCK_MONOTONIC time, in ms. It is the mono→epoch offset
+    /// plus the epoch→server offset, stored as one value: a reader never combines a new part
+    /// with an old one (a wall-clock step changes both parts).
+    pub mono_server_offset_ms: AtomicU64,
     /// f32 bits: output gain of the local copy. 0 (the default) is silence.
     pub gain: AtomicU32,
     /// f32 bits: ramp duration of gain changes, in s.
@@ -97,12 +97,10 @@ pub struct PlayoutShared {
 }
 
 impl PlayoutShared {
-    /// Server time in ms of a CLOCK_MONOTONIC time: `epoch = mono + mono_epoch_offset_ms`,
-    /// `server = epoch + server_offset_ms`. Real-time safe.
+    /// Server time in ms of a CLOCK_MONOTONIC time. Real-time safe.
     pub fn mono_to_server_ms(&self, mono_ns: i64) -> f64 {
-        let load = |a: &AtomicU64| f64::from_bits(a.load(Ordering::Relaxed));
-        let epoch_ms = mono_ns as f64 / 1_000_000.0 + load(&self.mono_epoch_offset_ms);
-        epoch_ms + load(&self.server_offset_ms)
+        let offset_ms = f64::from_bits(self.mono_server_offset_ms.load(Ordering::Relaxed));
+        mono_ns as f64 / 1_000_000.0 + offset_ms
     }
 }
 
@@ -150,20 +148,14 @@ mod tests {
     }
 
     #[test]
-    fn mono_to_server_adds_both_offsets() {
+    fn mono_to_server_adds_the_offset() {
         // A sign error here shifts the local copy against the room.
         let shared = PlayoutShared::default();
-        let epoch_offset = 1_700_000_000_000.0_f64;
+        let offset = 1_700_000_000_000.0_f64 - 50.0;
         shared
-            .mono_epoch_offset_ms
-            .store(epoch_offset.to_bits(), Ordering::Relaxed);
-        shared
-            .server_offset_ms
-            .store((-50.0_f64).to_bits(), Ordering::Relaxed);
+            .mono_server_offset_ms
+            .store(offset.to_bits(), Ordering::Relaxed);
         let server = shared.mono_to_server_ms(2_000_000_000);
-        assert!(
-            (server - (epoch_offset + 2000.0 - 50.0)).abs() < 1e-3,
-            "{server}"
-        );
+        assert!((server - (offset + 2000.0)).abs() < 1e-3, "{server}");
     }
 }

@@ -414,8 +414,8 @@ mod tests {
                     let store = |a: &std::sync::atomic::AtomicU64, v: f64| {
                         a.store(v.to_bits(), Ordering::Relaxed)
                     };
-                    store(&shared.mono_epoch_offset_ms, epoch_offset_ms);
-                    store(&shared.server_offset_ms, 0.0);
+                    // Server time = local clock time (a server offset of 0).
+                    store(&shared.mono_server_offset_ms, epoch_offset_ms);
                     shared.gain.store(1.0_f32.to_bits(), Ordering::Relaxed);
                     let (capture_tx, captured) = rtrb::RingBuffer::new(256);
                     let (blocks, playout_rx) = rtrb::RingBuffer::new(64);

@@ -124,7 +124,8 @@ impl StreamerHandle {
 
         let shared = Arc::new(PlayoutShared::default());
         let mono_epoch_offset_ms = MonoEpochMap::measure().to_epoch_ms(0);
-        store_f64(&shared.mono_epoch_offset_ms, mono_epoch_offset_ms);
+        // No server offset yet: nothing is stamped before the first one.
+        store_f64(&shared.mono_server_offset_ms, mono_epoch_offset_ms);
         // Full volume until the room says otherwise (the default 0 is silence).
         shared.gain.store(1.0_f32.to_bits(), Ordering::Relaxed);
         shared
@@ -159,6 +160,7 @@ impl StreamerHandle {
             status_tx,
             shared,
             mono_epoch_offset_ms,
+            server_offset_ms: 0.0,
             offset_known,
             next_session_id: 0,
             active_session_id: None,
@@ -256,9 +258,10 @@ struct EngineTask {
     audio_tx: Option<mpsc::UnboundedSender<AudioCmd>>,
     status_tx: watch::Sender<Status>,
     shared: Arc<PlayoutShared>,
-    /// The last measured mono→epoch offset; this task is the only writer of
-    /// `shared.mono_epoch_offset_ms`.
+    /// The last measured mono→epoch offset.
     mono_epoch_offset_ms: f64,
+    /// The last epoch→server offset from the engine.
+    server_offset_ms: f64,
     offset_known: Arc<AtomicBool>,
     next_session_id: u64,
     /// The audio session that runs; failures of other sessions are stale.
@@ -327,11 +330,22 @@ impl EngineTask {
         let offset_ms = MonoEpochMap::measure().to_epoch_ms(0);
         let step = clock_step_ms(self.mono_epoch_offset_ms, offset_ms);
         self.mono_epoch_offset_ms = offset_ms;
-        store_f64(&self.shared.mono_epoch_offset_ms, offset_ms);
         if let Some(delta_ms) = step {
             eprintln!("streamer: the system clock stepped by {delta_ms:.1} ms");
+            // Its `ServerOffset` publishes the new epoch part together with the moved server
+            // part, never the new epoch part alone.
             self.feed(Input::ClockStepped { delta_ms });
         }
+        self.publish_offset();
+    }
+
+    /// Stores the mono→server offset for the audio threads as one value. This task is its
+    /// only writer.
+    fn publish_offset(&self) {
+        store_f64(
+            &self.shared.mono_server_offset_ms,
+            self.mono_epoch_offset_ms + self.server_offset_ms,
+        );
     }
 
     fn feed(&mut self, input: Input) {
@@ -371,7 +385,8 @@ impl EngineTask {
                 self.audio(AudioCmd::Stop);
             }
             Output::ServerOffset { offset_ms } => {
-                store_f64(&self.shared.server_offset_ms, offset_ms);
+                self.server_offset_ms = offset_ms;
+                self.publish_offset();
                 self.offset_known.store(true, Ordering::Release);
             }
             Output::SetPlayoutGain { gain, ramp_s } => {
