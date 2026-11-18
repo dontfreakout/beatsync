@@ -124,7 +124,8 @@ impl StreamerHandle {
 
         let shared = Arc::new(PlayoutShared::default());
         let mono_epoch_offset_ms = MonoEpochMap::measure().to_epoch_ms(0);
-        store_f64(&shared.mono_epoch_offset_ms, mono_epoch_offset_ms);
+        // No server offset yet: nothing is stamped before the first one.
+        store_f64(&shared.mono_server_offset_ms, mono_epoch_offset_ms);
         // Full volume until the room says otherwise (the default 0 is silence).
         shared.gain.store(1.0_f32.to_bits(), Ordering::Relaxed);
         shared
@@ -159,6 +160,7 @@ impl StreamerHandle {
             status_tx,
             shared,
             mono_epoch_offset_ms,
+            server_offset_ms: 0.0,
             offset_known,
             next_session_id: 0,
             active_session_id: None,
@@ -256,9 +258,10 @@ struct EngineTask {
     audio_tx: Option<mpsc::UnboundedSender<AudioCmd>>,
     status_tx: watch::Sender<Status>,
     shared: Arc<PlayoutShared>,
-    /// The last measured mono→epoch offset; this task is the only writer of
-    /// `shared.mono_epoch_offset_ms`.
+    /// The last measured mono→epoch offset.
     mono_epoch_offset_ms: f64,
+    /// The last epoch→server offset from the engine.
+    server_offset_ms: f64,
     offset_known: Arc<AtomicBool>,
     next_session_id: u64,
     /// The audio session that runs; failures of other sessions are stale.
@@ -327,11 +330,22 @@ impl EngineTask {
         let offset_ms = MonoEpochMap::measure().to_epoch_ms(0);
         let step = clock_step_ms(self.mono_epoch_offset_ms, offset_ms);
         self.mono_epoch_offset_ms = offset_ms;
-        store_f64(&self.shared.mono_epoch_offset_ms, offset_ms);
         if let Some(delta_ms) = step {
             eprintln!("streamer: the system clock stepped by {delta_ms:.1} ms");
+            // Its `ServerOffset` publishes the new epoch part together with the moved server
+            // part, never the new epoch part alone.
             self.feed(Input::ClockStepped { delta_ms });
         }
+        self.publish_offset();
+    }
+
+    /// Stores the mono→server offset for the audio threads as one value. This task is its
+    /// only writer.
+    fn publish_offset(&self) {
+        store_f64(
+            &self.shared.mono_server_offset_ms,
+            self.mono_epoch_offset_ms + self.server_offset_ms,
+        );
     }
 
     fn feed(&mut self, input: Input) {
@@ -371,7 +385,8 @@ impl EngineTask {
                 self.audio(AudioCmd::Stop);
             }
             Output::ServerOffset { offset_ms } => {
-                store_f64(&self.shared.server_offset_ms, offset_ms);
+                self.server_offset_ms = offset_ms;
+                self.publish_offset();
                 self.offset_known.store(true, Ordering::Release);
             }
             Output::SetPlayoutGain { gain, ramp_s } => {
@@ -714,10 +729,13 @@ impl BlockAssembler {
         }
     }
 
-    /// The chunk does not continue the previous one (lost audio or a capture restart).
+    /// The chunk does not continue the previous one: audio was lost before it, or its time
+    /// does not follow (a capture restart).
     fn is_gap(&self, chunk: &CapturedChunk) -> bool {
-        self.next_ns
-            .is_some_and(|next| (chunk.mono_ns_first_frame - next).abs() > CAPTURE_GAP_NS)
+        chunk.after_loss
+            || self
+                .next_ns
+                .is_some_and(|next| (chunk.mono_ns_first_frame - next).abs() > CAPTURE_GAP_NS)
     }
 
     /// Forgets the partial block and the expected next chunk.
@@ -764,6 +782,7 @@ mod tests {
             mono_ns_first_frame: mono_ns,
             frames,
             samples: [0.0; CHUNK_MAX_FRAMES * 2],
+            after_loss: false,
         };
         for i in 0..frames {
             let v = (first_frame + i) as f32;
@@ -811,5 +830,19 @@ mod tests {
         blocks.clear();
         asm.push(&c, |first_ns, s| blocks.push((first_ns, s[0], 0.0)));
         assert_eq!(blocks, vec![(resume_ns, 0.0, 0.0)]);
+    }
+
+    #[test]
+    fn a_chunk_after_lost_audio_is_a_gap() {
+        // One lost 1024-frame chunk moves the next chunk by only 21 ms. Without the mark the
+        // assembler joins audio across the hole, and the timeline stamps the following
+        // blocks up to 21 ms early for seconds.
+        let mut asm = BlockAssembler::new();
+        let t0 = 7_000_000_000_i64;
+        asm.push(&chunk(t0, 0, 1024), |_, _| {});
+        let mut next = chunk(t0 + frames_to_ns(2 * 1024), 2 * 1024, 1024);
+        assert!(!asm.is_gap(&next), "too short for the time check");
+        next.after_loss = true;
+        assert!(asm.is_gap(&next));
     }
 }

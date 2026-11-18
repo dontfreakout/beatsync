@@ -28,6 +28,8 @@ pub(super) struct CaptureState {
     shared: Arc<PlayoutShared>,
     /// Filled in place, then copied into the ring (keeps 8 KiB off the real-time stack).
     chunk: Box<CapturedChunk>,
+    /// Audio was lost since the last chunk that went into the ring.
+    lost: bool,
 }
 
 fn capture_properties(target: &str) -> PropertiesBox {
@@ -50,7 +52,8 @@ fn capture_properties(target: &str) -> PropertiesBox {
 }
 
 /// Captures the monitor of the sink with `node.name` = `target` into `tx`. Full ring: the
-/// chunk is dropped and counted in `shared.capture_dropped`. The timestamps assume that the
+/// chunk is dropped and counted in `shared.capture_dropped`, and the next chunk is marked
+/// [`CapturedChunk::after_loss`]. The timestamps assume that the
 /// sink drives its graph, as a null sink does (see [`buffer_starts`]).
 pub(super) fn connect_capture(
     core: &CoreRc,
@@ -73,7 +76,9 @@ pub(super) fn connect_capture(
             mono_ns_first_frame: 0,
             frames: 0,
             samples: [0.0; CHUNK_MAX_FRAMES * 2],
+            after_loss: false,
         }),
+        lost: false,
     };
     media::connect(core, spec, state, process, on_state)
 }
@@ -108,7 +113,7 @@ pub(super) fn emit_chunks(
     bytes: &[u8],
     first_ns: i64,
     chunk: &mut CapturedChunk,
-    mut push: impl FnMut(&CapturedChunk),
+    mut push: impl FnMut(&mut CapturedChunk),
 ) {
     let whole = bytes.len() / STRIDE * STRIDE;
     for (index, part) in bytes[..whole].chunks(CHUNK_MAX_FRAMES * STRIDE).enumerate() {
@@ -122,6 +127,21 @@ pub(super) fn emit_chunks(
         }
         rest.fill(0.0);
         push(chunk);
+    }
+}
+
+/// Pushes `chunk` into the ring and marks it when audio was lost before it. A full ring drops
+/// the chunk and counts it. Real-time safe.
+fn push_chunk(
+    tx: &mut rtrb::Producer<CapturedChunk>,
+    shared: &PlayoutShared,
+    lost: &mut bool,
+    chunk: &mut CapturedChunk,
+) {
+    chunk.after_loss = *lost;
+    *lost = tx.push(*chunk).is_err();
+    if *lost {
+        shared.capture_dropped.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -162,6 +182,7 @@ fn process(stream: &Stream, st: &mut CaptureState) {
         st.shared
             .capture_dropped
             .fetch_add(chunks as u64, Ordering::Relaxed);
+        st.lost |= chunks > 0;
         return;
     };
     let mut starts = [0_i64; MAX_HELD];
@@ -170,13 +191,16 @@ fn process(stream: &Stream, st: &mut CaptureState) {
         &frames[..count],
         &mut starts[..count],
     );
-    let CaptureState { tx, shared, chunk } = st;
+    let CaptureState {
+        tx,
+        shared,
+        chunk,
+        lost,
+    } = st;
     for (buffer, &start) in held[..count].iter_mut().zip(&starts[..count]) {
         let Some(buffer) = buffer else { continue };
         emit_chunks(valid_bytes(buffer), start, chunk, |c| {
-            if tx.push(*c).is_err() {
-                shared.capture_dropped.fetch_add(1, Ordering::Relaxed);
-            }
+            push_chunk(tx, shared, lost, c)
         });
     }
     // Dropping `held` gives the buffers back to the stream.
@@ -232,9 +256,11 @@ mod tests {
             mono_ns_first_frame: 0,
             frames: 0,
             samples: [7.0; CHUNK_MAX_FRAMES * 2],
+            after_loss: false,
         };
         let mut got = Vec::new();
         emit_chunks(&bytes, 1_000 * MS, &mut chunk, |c| got.push(*c));
+        assert!(got.iter().all(|c| !c.after_loss));
         let sizes: Vec<usize> = got.iter().map(|c| c.frames).collect();
         assert_eq!(sizes, [1024, 1024, 452]);
         for (k, c) in got.iter().enumerate() {
@@ -248,5 +274,31 @@ mod tests {
             );
         }
         assert!(got[2].samples[452 * 2..].iter().all(|&s| s == 0.0));
+    }
+
+    #[test]
+    fn the_chunk_after_a_full_ring_is_marked() {
+        // A dropped 1024-frame chunk is a 21 ms hole, too short for the worker's 50 ms time
+        // check; unmarked, the next block would join audio across the hole.
+        let (mut tx, mut rx) = rtrb::RingBuffer::<CapturedChunk>::new(1);
+        let shared = PlayoutShared::default();
+        let mut lost = false;
+        let mut chunk = CapturedChunk {
+            mono_ns_first_frame: 0,
+            frames: 1024,
+            samples: [0.0; CHUNK_MAX_FRAMES * 2],
+            after_loss: false,
+        };
+        push_chunk(&mut tx, &shared, &mut lost, &mut chunk);
+        push_chunk(&mut tx, &shared, &mut lost, &mut chunk); // full: dropped
+        assert_eq!(shared.capture_dropped.load(Ordering::Relaxed), 1);
+        assert!(!rx.pop().unwrap().after_loss);
+        push_chunk(&mut tx, &shared, &mut lost, &mut chunk);
+        assert!(rx.pop().unwrap().after_loss, "the chunk after the drop");
+        push_chunk(&mut tx, &shared, &mut lost, &mut chunk);
+        assert!(
+            !rx.pop().unwrap().after_loss,
+            "the mark is for one chunk only"
+        );
     }
 }

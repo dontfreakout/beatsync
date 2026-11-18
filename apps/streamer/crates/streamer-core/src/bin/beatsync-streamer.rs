@@ -196,14 +196,21 @@ async fn stream(settings: Settings, backend: Arc<dyn AudioBackend>) -> ExitCode 
             return ExitCode::FAILURE;
         }
     };
-    let apps = settings.selected_apps.clone();
-    let delay_ms = settings.delay_ms;
+    // Started only after the first sync: before it, the worker drops the captured audio, so
+    // the routed apps would be silent, and stay silent while the server does not answer.
+    let mut pending_start = Some((settings.selected_apps.clone(), settings.delay_ms));
     let handle = StreamerHandle::connect(settings, backend).await;
     let mut status = handle.status();
-    handle.start(apps, delay_ms);
 
-    let mut last = status_line(&status.borrow_and_update());
+    let (line, synced_once) = {
+        let s = status.borrow_and_update();
+        (status_line(&s), s.synced_once)
+    };
+    let mut last = line;
     println!("{last}");
+    if synced_once && let Some((apps, delay_ms)) = pending_start.take() {
+        handle.start(apps, delay_ms);
+    }
     let sync_notice = tokio::time::sleep(SYNC_NOTICE_AFTER);
     tokio::pin!(sync_notice);
     let mut sync_notice_due = true;
@@ -222,10 +229,16 @@ async fn stream(settings: Settings, backend: Arc<dyn AudioBackend>) -> ExitCode 
                     // No engine (invalid server URL): the last status says why.
                     break;
                 }
-                let line = status_line(&status.borrow_and_update());
+                let (line, synced_once) = {
+                    let s = status.borrow_and_update();
+                    (status_line(&s), s.synced_once)
+                };
                 if line != last {
                     println!("{line}");
                     last = line;
+                }
+                if synced_once && let Some((apps, delay_ms)) = pending_start.take() {
+                    handle.start(apps, delay_ms);
                 }
             }
         }
