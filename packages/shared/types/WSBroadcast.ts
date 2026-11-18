@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { LOW_PASS_CONSTANTS } from "../constants";
+import { LIVE_STREAM_CONSTANTS, LOW_PASS_CONSTANTS } from "../constants";
 import {
   LocationSchema,
   PauseActionSchema,
@@ -18,9 +18,13 @@ export const ServerActionEnum = z.enum([
   "NTP_RESPONSE", // Reply to an NTP_REQUEST time sync probe
   "SEARCH_RESPONSE", // Music search results
   "LIVENESS_PING", // Liveness probe; client replies with LIVENESS_PONG
+  "LIVE_STREAM_REJECTED", // A START_LIVE_STREAM request was refused
 ]);
 
 // Client change
+export const ClientKindEnum = z.enum(["web", "streamer"]);
+export type ClientKind = z.infer<typeof ClientKindEnum>;
+
 export const ClientDataSchema = z.object({
   username: z.string(),
   clientId: z.string(),
@@ -33,6 +37,7 @@ export const ClientDataSchema = z.object({
   lastLivenessPingAt: z.number().default(0), // When the server last sent a LIVENESS_PING (server-managed)
   isAdmin: z.boolean().default(false), // Admin status
   isCreator: z.boolean().default(false), // Site creator badge
+  kind: ClientKindEnum.default("web"), // Native streamer apps join as "streamer"
   location: LocationSchema.optional(),
   joinedAt: z.number(), // Timestamp when the client joined the room
 });
@@ -66,6 +71,27 @@ const LoadAudioSourceSchema = z.object({
 });
 export type LoadAudioSourceType = z.infer<typeof LoadAudioSourceSchema>;
 
+export const LiveStreamSchema = z.object({
+  streamId: z.number().int().nonnegative(),
+  sourceClientId: z.string(),
+  sourceUsername: z.string(),
+  label: z.string(),
+  codec: z.literal(LIVE_STREAM_CONSTANTS.CODEC),
+  sampleRate: z.literal(LIVE_STREAM_CONSTANTS.SAMPLE_RATE),
+  channels: z.union([z.literal(1), z.literal(2)]),
+  frameDurationMs: z.literal(LIVE_STREAM_CONSTANTS.FRAME_DURATION_MS),
+  delayMs: z.number(),
+  startedAt: z.number(),
+});
+export type LiveStreamType = z.infer<typeof LiveStreamSchema>;
+
+// Live stream state; stream is null when no stream is active
+const LiveStreamStateSchema = z.object({
+  type: z.literal("LIVE_STREAM_STATE"),
+  stream: LiveStreamSchema.nullable(),
+  stoppedByClientId: z.string().optional(),
+});
+
 const RoomEventSchema = z.object({
   type: z.literal(ServerActionEnum.enum.ROOM_EVENT),
   event: z.discriminatedUnion("type", [
@@ -74,6 +100,7 @@ const RoomEventSchema = z.object({
     SetPlaybackControlsSchema,
     ChatUpdateSchema,
     LoadAudioSourceSchema,
+    LiveStreamStateSchema,
   ]),
 });
 

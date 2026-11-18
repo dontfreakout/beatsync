@@ -139,6 +139,11 @@ export const ConnectedUserItem = memo<ConnectedUserItemProps>(({ client, isCurre
       >
         {client.isCreator ? "Creator" : isCurrentUser ? "You" : "Connected"}
       </Badge>
+      {client.kind === "streamer" && (
+        <Badge variant="outline" className="text-xs shrink-0 py-0 h-5 border-red-500/60 text-red-400">
+          Streamer
+        </Badge>
+      )}
       {/* Admin controls dropdown - only show if current user is admin and not targeting self */}
       {isAdmin && !isCurrentUser && (
         <DropdownMenu>

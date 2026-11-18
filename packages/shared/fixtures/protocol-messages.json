@@ -1,0 +1,219 @@
+{
+  "clientToServer": [
+    {
+      "name": "ntpRequestMinimal",
+      "message": { "type": "NTP_REQUEST", "t0": 1700000000123.5, "probeGroupId": 7, "probeGroupIndex": 0 }
+    },
+    {
+      "name": "ntpRequestFull",
+      "message": {
+        "type": "NTP_REQUEST",
+        "t0": 1700000000148.25,
+        "probeGroupId": 7,
+        "probeGroupIndex": 1,
+        "clientRTT": 12.5,
+        "clientCompensationMs": 0,
+        "clientNudgeMs": 0
+      }
+    },
+    { "name": "livenessPong", "message": { "type": "LIVENESS_PONG" } },
+    {
+      "name": "startLiveStream",
+      "message": {
+        "type": "START_LIVE_STREAM",
+        "codec": "opus",
+        "sampleRate": 48000,
+        "channels": 2,
+        "frameDurationMs": 20,
+        "delayMs": 1000,
+        "label": "Spotify"
+      }
+    },
+    { "name": "updateLiveStream", "message": { "type": "UPDATE_LIVE_STREAM", "label": "Firefox" } },
+    { "name": "stopLiveStream", "message": { "type": "STOP_LIVE_STREAM" } }
+  ],
+  "serverToClient": [
+    {
+      "name": "ntpResponse",
+      "known": true,
+      "message": {
+        "type": "NTP_RESPONSE",
+        "t0": 1700000000123.5,
+        "t1": 1700000000130,
+        "t2": 1700000000131,
+        "clientRTT": 12.5,
+        "probeGroupId": 7,
+        "probeGroupIndex": 0
+      }
+    },
+    { "name": "livenessPing", "known": true, "message": { "type": "LIVENESS_PING" } },
+    {
+      "name": "clientChange",
+      "known": true,
+      "message": {
+        "type": "ROOM_EVENT",
+        "event": {
+          "type": "CLIENT_CHANGE",
+          "clients": [
+            {
+              "username": "alice",
+              "clientId": "c1a2b3d4-0000-4000-8000-000000000001",
+              "rtt": 18,
+              "compensationMs": 45,
+              "nudgeMs": 0,
+              "position": { "x": 50, "y": 25 },
+              "lastNtpResponse": 1700000000131,
+              "lastSeenAt": 1700000000131,
+              "lastLivenessPingAt": 0,
+              "isAdmin": true,
+              "isCreator": false,
+              "kind": "web",
+              "joinedAt": 1700000000000
+            },
+            {
+              "username": "desktop-streamer",
+              "clientId": "c1a2b3d4-0000-4000-8000-000000000002",
+              "rtt": 6,
+              "compensationMs": 0,
+              "nudgeMs": 0,
+              "position": { "x": 50, "y": 75 },
+              "lastNtpResponse": 1700000000125,
+              "lastSeenAt": 1700000000125,
+              "lastLivenessPingAt": 0,
+              "isAdmin": false,
+              "isCreator": false,
+              "kind": "streamer",
+              "joinedAt": 1700000000050
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "setPlaybackControls",
+      "known": true,
+      "message": { "type": "ROOM_EVENT", "event": { "type": "SET_PLAYBACK_CONTROLS", "permissions": "EVERYONE" } }
+    },
+    {
+      "name": "liveStreamStateActive",
+      "known": true,
+      "message": {
+        "type": "ROOM_EVENT",
+        "event": {
+          "type": "LIVE_STREAM_STATE",
+          "stream": {
+            "streamId": 3,
+            "sourceClientId": "c1a2b3d4-0000-4000-8000-000000000002",
+            "sourceUsername": "desktop-streamer",
+            "label": "Spotify",
+            "codec": "opus",
+            "sampleRate": 48000,
+            "channels": 2,
+            "frameDurationMs": 20,
+            "delayMs": 1000,
+            "startedAt": 1700000005000
+          }
+        }
+      }
+    },
+    {
+      "name": "liveStreamStateNull",
+      "known": true,
+      "message": { "type": "ROOM_EVENT", "event": { "type": "LIVE_STREAM_STATE", "stream": null } }
+    },
+    {
+      "name": "liveStreamStateStoppedBy",
+      "known": true,
+      "message": {
+        "type": "ROOM_EVENT",
+        "event": {
+          "type": "LIVE_STREAM_STATE",
+          "stream": null,
+          "stoppedByClientId": "c1a2b3d4-0000-4000-8000-000000000001"
+        }
+      }
+    },
+    {
+      "name": "liveStreamRejectedNotAllowed",
+      "known": true,
+      "message": { "type": "LIVE_STREAM_REJECTED", "reason": "NOT_ALLOWED" }
+    },
+    {
+      "name": "liveStreamRejectedAlreadyActive",
+      "known": true,
+      "message": { "type": "LIVE_STREAM_REJECTED", "reason": "ALREADY_ACTIVE" }
+    },
+    {
+      "name": "globalVolumeConfig",
+      "known": true,
+      "message": {
+        "type": "SCHEDULED_ACTION",
+        "serverTimeToExecute": 1700000010000,
+        "scheduledAction": { "type": "GLOBAL_VOLUME_CONFIG", "volume": 0.8, "rampTime": 0.1 }
+      }
+    },
+    {
+      "name": "spatialConfig",
+      "known": true,
+      "message": {
+        "type": "SCHEDULED_ACTION",
+        "serverTimeToExecute": 1700000010100,
+        "scheduledAction": {
+          "type": "SPATIAL_CONFIG",
+          "gains": {
+            "c1a2b3d4-0000-4000-8000-000000000001": { "gain": 0.75, "rampTime": 0.25 },
+            "c1a2b3d4-0000-4000-8000-000000000002": { "gain": 0.5, "rampTime": 0.1 }
+          },
+          "listeningSource": { "x": 50, "y": 50 }
+        }
+      }
+    },
+    {
+      "name": "stopSpatialAudio",
+      "known": true,
+      "message": {
+        "type": "SCHEDULED_ACTION",
+        "serverTimeToExecute": 1700000010200,
+        "scheduledAction": { "type": "STOP_SPATIAL_AUDIO" }
+      }
+    },
+    {
+      "name": "streamJobUpdate",
+      "known": false,
+      "message": { "type": "STREAM_JOB_UPDATE", "activeJobCount": 2 }
+    },
+    {
+      "name": "chatUpdate",
+      "known": false,
+      "message": {
+        "type": "ROOM_EVENT",
+        "event": {
+          "type": "CHAT_UPDATE",
+          "messages": [
+            {
+              "id": 1,
+              "clientId": "c1a2b3d4-0000-4000-8000-000000000001",
+              "username": "alice",
+              "text": "hello",
+              "timestamp": 1700000006000,
+              "countryCode": "CZ",
+              "isCreator": false
+            }
+          ],
+          "isFullSync": false,
+          "newestId": 1
+        }
+      }
+    },
+    {
+      "name": "scheduledPlay",
+      "known": false,
+      "message": {
+        "type": "SCHEDULED_ACTION",
+        "serverTimeToExecute": 1700000012000,
+        "scheduledAction": { "type": "PLAY", "trackTimeSeconds": 0, "audioSource": "https://cdn.example.com/room-123456/track.mp3" }
+      }
+    },
+    { "name": "demoUserCount", "known": false, "message": { "type": "DEMO_USER_COUNT", "count": 3 } }
+  ]
+}

@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { CHAT_CONSTANTS, LOW_PASS_CONSTANTS } from "../constants";
+import { CHAT_CONSTANTS, LIVE_STREAM_CONSTANTS, LOW_PASS_CONSTANTS } from "../constants";
 import { AudioSourceSchema, PositionSchema } from "./basic";
 
 // ROOM EVENTS
@@ -36,6 +36,9 @@ export const ClientActionEnum = z.enum([
   "SET_METRONOME", // Toggle metronome on/off for all clients
   "SET_LOW_PASS_FREQ", // Set low-pass filter cutoff frequency
   "LIVENESS_PONG", // Liveness reply to a server LIVENESS_PING
+  "START_LIVE_STREAM", // Source client starts a live audio stream
+  "UPDATE_LIVE_STREAM", // Source client updates the stream label
+  "STOP_LIVE_STREAM", // Stop the live stream
 ]);
 
 export const NTPRequestPacketSchema = z.object({
@@ -166,6 +169,26 @@ export const LivenessPongSchema = z.object({
   type: z.literal(ClientActionEnum.enum.LIVENESS_PONG),
 });
 
+export const StartLiveStreamSchema = z.object({
+  type: z.literal(ClientActionEnum.enum.START_LIVE_STREAM),
+  codec: z.literal(LIVE_STREAM_CONSTANTS.CODEC),
+  sampleRate: z.literal(LIVE_STREAM_CONSTANTS.SAMPLE_RATE),
+  channels: z.union([z.literal(1), z.literal(2)]),
+  frameDurationMs: z.literal(LIVE_STREAM_CONSTANTS.FRAME_DURATION_MS),
+  delayMs: z.number().int().min(LIVE_STREAM_CONSTANTS.MIN_DELAY_MS).max(LIVE_STREAM_CONSTANTS.MAX_DELAY_MS),
+  label: z.string().max(LIVE_STREAM_CONSTANTS.MAX_LABEL_LENGTH),
+});
+export type StartLiveStreamType = z.infer<typeof StartLiveStreamSchema>;
+
+export const UpdateLiveStreamSchema = z.object({
+  type: z.literal(ClientActionEnum.enum.UPDATE_LIVE_STREAM),
+  label: z.string().max(LIVE_STREAM_CONSTANTS.MAX_LABEL_LENGTH),
+});
+
+export const StopLiveStreamSchema = z.object({
+  type: z.literal(ClientActionEnum.enum.STOP_LIVE_STREAM),
+});
+
 export const WSRequestSchema = z.discriminatedUnion("type", [
   PlayActionSchema,
   PauseActionSchema,
@@ -190,6 +213,9 @@ export const WSRequestSchema = z.discriminatedUnion("type", [
   SetMetronomeSchema,
   SetLowPassFreqSchema,
   LivenessPongSchema,
+  StartLiveStreamSchema,
+  UpdateLiveStreamSchema,
+  StopLiveStreamSchema,
 ]);
 export type WSRequestType = z.infer<typeof WSRequestSchema>;
 export type PlayActionType = z.infer<typeof PlayActionSchema>;

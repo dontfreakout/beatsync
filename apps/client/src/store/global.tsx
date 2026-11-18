@@ -7,6 +7,7 @@ import { getApiUrl } from "@/lib/urls";
 import { extractFileNameFromUrl } from "@/lib/utils";
 import {
   calculateOffsetEstimate,
+  calculateLocalDelayMs,
   calculateWaitTimeMilliseconds,
   getProbeStats,
   NTPMeasurement,
@@ -36,6 +37,7 @@ import {
 } from "@beatsync/shared";
 import { Mutex } from "async-mutex";
 import { toast } from "sonner";
+import { useLiveStreamStore } from "@/store/liveStream";
 import { create } from "zustand";
 
 export const MAX_NTP_MEASUREMENTS = NTP_CONSTANTS.MAX_MEASUREMENTS;
@@ -341,10 +343,14 @@ export const getFilteredOutputLatencyMs = (): number => {
 };
 
 const getWaitTimeSeconds = (state: GlobalState, targetServerTime: number) => {
-  const effectiveOffset = state.offsetEstimate + state.nudgeOffsetMs;
-  const waitTimeMilliseconds = calculateWaitTimeMilliseconds(targetServerTime, effectiveOffset);
-  const outputLatencyMs = getFilteredOutputLatencyMs();
-  return Math.max(0, (waitTimeMilliseconds - outputLatencyMs) / 1000);
+  const delayMs = calculateLocalDelayMs({
+    targetServerTimeMs: targetServerTime,
+    nowEpochMs: epochNow(),
+    offsetEstimateMs: state.offsetEstimate,
+    nudgeMs: state.nudgeOffsetMs,
+    outputLatencyMs: getFilteredOutputLatencyMs(),
+  });
+  return Math.max(0, delayMs) / 1000;
 };
 
 const resolveAudioUrl = (url: string): string => (url.startsWith("/") ? `${getApiUrl()}${url}` : url);
@@ -543,10 +549,13 @@ export const useGlobalStore = create<GlobalState>((set, get) => {
     });
   };
 
-  /** Stop playback and reset to "Start System" if audio is actively playing. */
+  /** Stop playback and reset to "Start System" if audio is actively playing (a file or the live stream). */
   const stopAndResetIfPlaying = (reason: string) => {
     const currentState = get();
-    if (!currentState.isPlaying || !currentState.audioPlayer) return;
+    // The queue is paused during a live stream, so isPlaying alone misses live audio
+    const { stream, playHere } = useLiveStreamStore.getState();
+    const isLivePlaying = stream !== null && playHere;
+    if (!(currentState.isPlaying || isLivePlaying) || !currentState.audioPlayer) return;
     try {
       currentState.audioPlayer.sourceNode.stop();
     } catch {
@@ -903,6 +912,8 @@ export const useGlobalStore = create<GlobalState>((set, get) => {
 
     // if trackTimeSeconds is not provided, use the current track position
     broadcastPlay: (trackTimeSeconds?: number) => {
+      // Queue playback must not start while a live stream is active
+      if (useLiveStreamStore.getState().stream) return;
       const state = get();
       const { socket } = getSocket(state);
 

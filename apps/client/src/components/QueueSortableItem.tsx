@@ -1,5 +1,6 @@
 import { cn, extractFileNameFromUrl, formatTime } from "@/lib/utils";
 import { AudioSourceState, useGlobalStore } from "@/store/global";
+import { useLiveStreamStore } from "@/store/liveStream";
 import { sendWSRequest } from "@/utils/ws";
 import { ClientActionEnum } from "@beatsync/shared";
 import { useSortable } from "@dnd-kit/sortable";
@@ -46,6 +47,8 @@ export const QueueSortableItem = ({
 
   const handleItemClick = (sourceState: AudioSourceState) => {
     if (!canMutate) return;
+    // No local track switch while a live stream is active
+    if (useLiveStreamStore.getState().stream) return;
 
     // Don't allow interaction with loading or error tracks
     if (sourceState.status === "loading") {

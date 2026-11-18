@@ -3,6 +3,7 @@ import { globalManager } from "@/managers";
 import { sendBroadcast, sendToClient, sendUnicast } from "@/utils/responses";
 import type { BunServer, WSData } from "@/utils/websocket";
 import { dispatchMessage } from "@/websocket/dispatch";
+import { relayLiveFrame } from "@/websocket/liveRelay";
 import type { WSBroadcastType } from "@beatsync/shared";
 import { epochNow, WSRequestSchema } from "@beatsync/shared";
 import type { ServerWebSocket } from "bun";
@@ -77,6 +78,12 @@ export const handleOpen = (ws: ServerWebSocket<WSData>, server: BunServer) => {
         permissions: room.getPlaybackControlsPermissions(),
       },
     },
+  });
+
+  // Always sent (null when idle) so a reconnecting client never keeps a stale stream
+  sendToClient({
+    ws,
+    message: { type: "ROOM_EVENT", event: { type: "LIVE_STREAM_STATE", stream: room.getLiveStream() } },
   });
 
   sendUnicast({
@@ -162,6 +169,17 @@ export const handleOpen = (ws: ServerWebSocket<WSData>, server: BunServer) => {
 };
 
 export const handleMessage = async (ws: ServerWebSocket<WSData>, message: string | Buffer, server: BunServer) => {
+  // Binary frames are live stream audio: relay them without JSON/Zod parsing
+  if (typeof message !== "string") {
+    try {
+      relayLiveFrame(ws, message);
+    } catch (error) {
+      // Logs only on failure: the success path runs for every frame
+      console.error(`Error relaying live frame from ${ws.data.clientId} in room ${ws.data.roomId}:`, error);
+    }
+    return;
+  }
+
   const t1 = epochNow(); // Always capture immediately on receive
   const { roomId, username } = ws.data;
 
@@ -227,7 +245,8 @@ export const handleClose = (ws: ServerWebSocket<WSData>, server: BunServer) => {
     const { roomId, clientId } = ws.data;
     const room = globalManager.getRoom(roomId);
 
-    if (room) {
+    // A late close of a replaced socket must not remove the reconnected client
+    if (room?.isCurrentConnection(clientId, ws)) {
       room.removeClient(clientId);
 
       // Schedule cleanup for rooms with no active connections

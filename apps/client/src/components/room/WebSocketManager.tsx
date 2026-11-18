@@ -4,8 +4,10 @@ import { useNtpHeartbeat } from "@/hooks/useNtpHeartbeat";
 import { useWebSocketReconnection } from "@/hooks/useWebSocketReconnection";
 import { IS_DEMO_MODE } from "@/lib/demo";
 import { getUserLocation } from "@/lib/ip";
+import { liveStreamPlayer } from "@/lib/liveStream/player";
 import { getWsUrl } from "@/lib/urls";
 import { useGlobalStore } from "@/store/global";
+import { useLiveStreamStore } from "@/store/liveStream";
 import { useRoomStore } from "@/store/room";
 import { sendWSRequest } from "@/utils/ws";
 import { ClientActionEnum, WSResponseSchema } from "@beatsync/shared";
@@ -72,6 +74,8 @@ export const WebSocketManager = ({ roomId, username }: WebSocketManagerProps) =>
     }
 
     const ws = new WebSocket(SOCKET_URL);
+    // Live stream audio arrives as binary frames
+    ws.binaryType = "arraybuffer";
 
     setSocket(ws);
 
@@ -114,12 +118,21 @@ export const WebSocketManager = ({ roomId, username }: WebSocketManagerProps) =>
       // Clear NTP measurements on new connection to avoid stale data
       useGlobalStore.getState().onConnectionReset();
 
+      // Drop the live stream; the server sends its current state again on rejoin
+      useLiveStreamStore.getState().reset();
+
       // Schedule reconnection with exponential backoff
       scheduleReconnection();
     };
 
     const context = { ws, markNTPResponseReceived };
     ws.onmessage = (msg) => {
+      // Live stream frames arrive ~50/s: keep them off the JSON path and out of store writes
+      if (msg.data instanceof ArrayBuffer) {
+        liveStreamPlayer.handleFrame(msg.data);
+        return;
+      }
+
       // Update last message received time for connection health
       useGlobalStore.setState({ lastMessageReceivedTime: Date.now() });
 
@@ -190,6 +203,9 @@ export const WebSocketManager = ({ roomId, username }: WebSocketManagerProps) =>
       // Stop NTP heartbeat
       stopHeartbeat();
       ws.close();
+
+      // Leaving the room: stop live playback
+      useLiveStreamStore.getState().reset();
     };
     // Not including socket in the dependency array because it will trigger the close when it's set
     // eslint-disable-next-line react-hooks/exhaustive-deps
