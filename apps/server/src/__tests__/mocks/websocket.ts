@@ -1,12 +1,13 @@
 import type { ServerWebSocket } from "bun";
 import { mock } from "bun:test";
+import type { ClientKind } from "@beatsync/shared";
 import type { BunServer, WSData } from "@/utils/websocket";
 
 export function createMockWs(data: {
   clientId: string;
   username?: string;
   roomId?: string;
-  kind?: "web" | "streamer";
+  kind?: ClientKind;
 }): ServerWebSocket<WSData> {
   return {
     data: {

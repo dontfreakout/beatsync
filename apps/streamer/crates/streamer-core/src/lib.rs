@@ -9,5 +9,6 @@ pub mod gain;
 pub mod ntp;
 pub mod playout;
 pub mod protocol;
+pub mod room;
 pub mod runtime;
 pub mod timeline;

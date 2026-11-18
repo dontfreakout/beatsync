@@ -3,7 +3,7 @@ import { useIsMobile } from "@/hooks/useIsMobile";
 import { cn } from "@/lib/utils";
 import { ClientDataType } from "@beatsync/shared";
 import { TooltipPortal } from "@radix-ui/react-tooltip";
-import { Crown, MoreVertical, User } from "lucide-react";
+import { Crown, Monitor, MoreVertical, User } from "lucide-react";
 import { motion } from "motion/react";
 import { memo, useState } from "react";
 import { Avatar, AvatarFallback, AvatarImage } from "../ui/avatar";
@@ -143,6 +143,11 @@ export const ConnectedUserItem = memo<ConnectedUserItemProps>(({ client, isCurre
         <Badge variant="outline" className="text-xs shrink-0 py-0 h-5 border-red-500/60 text-red-400">
           Streamer
         </Badge>
+      )}
+      {client.kind === "app" && (
+        <span className="shrink-0" title="Desktop app">
+          <Monitor className="h-3 w-3 text-neutral-400" aria-label="Desktop app" />
+        </span>
       )}
       {/* Admin controls dropdown - only show if current user is admin and not targeting self */}
       {isAdmin && !isCurrentUser && (

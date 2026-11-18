@@ -26,11 +26,12 @@ use crate::audio::{
 };
 use crate::clock::{MonoEpochMap, clock_step_ms, mono_ns};
 use crate::config::Settings;
-use crate::connection::{ConnEvent, Outgoing, build_ws_url, run_connection};
+use crate::connection::{ConnEvent, JoinKind, Outgoing, build_ws_url, run_connection};
 use crate::encoder::OpusFrameEncoder;
 use crate::engine::{Engine, Input, Output, Phase, Status};
 use crate::frame::{FRAME_DURATION_MS, FRAME_SAMPLES, MAX_DELAY_MS, MIN_DELAY_MS, SAMPLE_RATE};
 use crate::playout::{BLOCK_SAMPLES, CHANNELS, PcmBlock};
+use crate::room;
 use crate::timeline::CaptureTimeline;
 
 const TICK: Duration = Duration::from_millis(10);
@@ -62,15 +63,10 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Server time at which the local copy plays the first frame of a block stamped `stamp_ms`:
 /// the room's delay plus the encoder lookahead (receivers hear the decoded Opus that late)
-/// plus the manual local offset.
-pub fn local_target_ms(
-    stamp_ms: f64,
-    delay_ms: u32,
-    lookahead_samples: u32,
-    local_offset_ms: f64,
-) -> f64 {
+/// minus the nudge (positive plays earlier, like the web client).
+pub fn local_target_ms(stamp_ms: f64, delay_ms: u32, lookahead_samples: u32, nudge_ms: f64) -> f64 {
     let lookahead_ms = f64::from(lookahead_samples) * 1000.0 / f64::from(SAMPLE_RATE);
-    stamp_ms + f64::from(delay_ms) + lookahead_ms + local_offset_ms
+    stamp_ms + f64::from(delay_ms) + lookahead_ms - nudge_ms
 }
 
 /// A running streamer: one server connection, and an audio session while streaming.
@@ -90,6 +86,11 @@ enum Command {
     UpdateApps {
         apps: Vec<String>,
     },
+    SetNudge {
+        nudge_ms: f64,
+    },
+    /// A room action of the window, already checked.
+    Action(serde_json::Value),
     /// Answered when the audio task has done every call queued before it.
     Stop(oneshot::Sender<()>),
     Shutdown,
@@ -98,12 +99,24 @@ enum Command {
 impl StreamerHandle {
     /// Connects to the room in `settings` (and reconnects until [`Self::shutdown`]). An
     /// invalid server URL gives a handle that only reports the error in its status.
-    pub async fn connect(settings: Settings, backend: Arc<dyn AudioBackend>) -> Self {
+    ///
+    /// `room_feed` gets the raw room messages for the window ([`room::forwarded`]); the CLI
+    /// passes `None`. The app (`JoinKind::App`) also restores the server's stored nudge and
+    /// asks for the room's playback state.
+    pub async fn connect(
+        settings: Settings,
+        backend: Arc<dyn AudioBackend>,
+        kind: JoinKind,
+        room_feed: Option<mpsc::UnboundedSender<serde_json::Value>>,
+    ) -> Self {
         let (status_tx, status) = watch::channel(Status {
             connected: false,
             synced: false,
             synced_once: false,
             rtt_ms: None,
+            offset_ms: None,
+            sync_measurements: 0,
+            nudge_ms: settings.nudge_ms,
             listeners: 0,
             phase: Phase::Idle,
             message: None,
@@ -114,6 +127,7 @@ impl StreamerHandle {
             &settings.room_id,
             &settings.username,
             &settings.client_id,
+            kind,
         ) {
             Ok(url) => url,
             Err(e) => {
@@ -136,6 +150,7 @@ impl StreamerHandle {
         shared
             .gain_ramp_s
             .store(0.0_f32.to_bits(), Ordering::Relaxed);
+        store_f64(&shared.nudge_ms, settings.nudge_ms);
         let offset_known = Arc::new(AtomicBool::new(false));
 
         let (out_tx, out_rx) = mpsc::channel(OUTGOING_CAPACITY);
@@ -154,13 +169,18 @@ impl StreamerHandle {
                 offset_known: offset_known.clone(),
                 blocks: blocks_tx,
                 notes: notes_tx,
-                local_offset_ms: settings.local_offset_ms,
             },
         ));
 
         let engine = EngineTask {
-            engine: Engine::new(settings.client_id, settings.username),
+            engine: Engine::new(
+                settings.client_id,
+                settings.username,
+                settings.nudge_ms,
+                kind == JoinKind::App,
+            ),
             out_tx: Some(out_tx),
+            room_feed,
             audio_tx: Some(audio_tx),
             status_tx,
             shared,
@@ -202,12 +222,34 @@ impl StreamerHandle {
         let _ = self.commands.send(Command::UpdateApps { apps });
     }
 
+    /// Sets the nudge: the next block of the local copy uses it, and the server learns it.
+    pub fn set_nudge(&self, nudge_ms: f64) {
+        let _ = self.commands.send(Command::SetNudge { nudge_ms });
+    }
+
     /// Ends the stream and returns when the routing is restored.
     pub async fn stop(&self) {
         let (done, wait) = oneshot::channel();
         if self.commands.send(Command::Stop(done)).is_ok() {
             let _ = wait.await;
         }
+    }
+
+    /// Sends a room action of the window. Refused while disconnected (it would be lost) and
+    /// for the types the window may not send ([`room::check_action`]).
+    pub fn send_action(&self, action: serde_json::Value) -> Result<(), String> {
+        const NOT_CONNECTED: &str = "Not connected";
+        let streaming = {
+            let status = self.status.borrow();
+            if !status.connected {
+                return Err(NOT_CONNECTED.to_string());
+            }
+            status.phase != Phase::Idle
+        };
+        room::check_action(&action, streaming)?;
+        self.commands
+            .send(Command::Action(action))
+            .map_err(|_| NOT_CONNECTED.to_string())
     }
 
     pub fn status(&self) -> watch::Receiver<Status> {
@@ -260,6 +302,8 @@ struct EngineTask {
     engine: Engine,
     /// Dropped at shutdown: `run_connection` returns when it is gone.
     out_tx: Option<mpsc::Sender<Outgoing>>,
+    /// Where the raw room messages go; `None` for the CLI, or once the receiver is gone.
+    room_feed: Option<mpsc::UnboundedSender<serde_json::Value>>,
     audio_tx: Option<mpsc::UnboundedSender<AudioCmd>>,
     status_tx: watch::Sender<Status>,
     shared: Arc<PlayoutShared>,
@@ -287,6 +331,12 @@ impl EngineTask {
                         self.feed(Input::UserStart { apps, delay_ms });
                     }
                     Some(Command::UpdateApps { apps }) => self.feed(Input::UserUpdateApps { apps }),
+                    Some(Command::SetNudge { nudge_ms }) => {
+                        store_f64(&self.shared.nudge_ms, nudge_ms);
+                        self.feed(Input::UserNudge { nudge_ms });
+                    }
+                    // Actions bypass the engine: it has no state for them.
+                    Some(Command::Action(action)) => self.send(Outgoing::Action(action)),
                     Some(Command::Stop(done)) => {
                         self.feed(Input::UserStop);
                         self.audio(AudioCmd::Barrier(done));
@@ -294,7 +344,7 @@ impl EngineTask {
                     // A dropped handle shuts down too.
                     Some(Command::Shutdown) | None => break,
                 },
-                Some(event) = ch.events.recv() => self.feed(conn_input(event)),
+                Some(event) = ch.events.recv() => self.on_conn_event(event),
                 Some(block) = ch.blocks.recv() => self.feed(block),
                 Some(note) = ch.notes.recv() => match note {
                     Note::Failed { session_id, message } => {
@@ -353,6 +403,40 @@ impl EngineTask {
         );
     }
 
+    fn on_conn_event(&mut self, event: ConnEvent) {
+        let input = match event {
+            // For the window only: the engine gets the parsed copy, if any, as the next event.
+            ConnEvent::Room(message) => {
+                if let Some(feed) = &self.room_feed
+                    && feed.send(message).is_err()
+                {
+                    self.room_feed = None;
+                }
+                return;
+            }
+            ConnEvent::Connected => Input::Connected,
+            ConnEvent::Disconnected => Input::Disconnected,
+            ConnEvent::ConnectFailed(error) => Input::ConnectFailed { error },
+            ConnEvent::Message(message) => Input::Server(message),
+            ConnEvent::NtpResponse {
+                t0,
+                t1,
+                t2,
+                t3,
+                group_id,
+                index,
+            } => Input::NtpResponse {
+                t0,
+                t1,
+                t2,
+                t3,
+                group_id,
+                index,
+            },
+        };
+        self.feed(input);
+    }
+
     fn feed(&mut self, input: Input) {
         for output in self.engine.handle(input) {
             self.dispatch(output);
@@ -366,10 +450,13 @@ impl EngineTask {
             Output::SendProbePair {
                 group_id,
                 client_rtt,
+                client_nudge_ms,
             } => self.send(Outgoing::ProbePair {
                 group_id,
                 client_rtt,
+                client_nudge_ms,
             }),
+            Output::Nudge { nudge_ms } => store_f64(&self.shared.nudge_ms, nudge_ms),
             Output::StartAudio { apps, delay_ms } => {
                 self.next_session_id += 1;
                 let session_id = self.next_session_id;
@@ -427,29 +514,6 @@ impl EngineTask {
     }
 }
 
-fn conn_input(event: ConnEvent) -> Input {
-    match event {
-        ConnEvent::Connected => Input::Connected,
-        ConnEvent::Disconnected => Input::Disconnected,
-        ConnEvent::Message(message) => Input::Server(message),
-        ConnEvent::NtpResponse {
-            t0,
-            t1,
-            t2,
-            t3,
-            group_id,
-            index,
-        } => Input::NtpResponse {
-            t0,
-            t1,
-            t2,
-            t3,
-            group_id,
-            index,
-        },
-    }
-}
-
 enum AudioCmd {
     Start {
         session_id: u64,
@@ -470,7 +534,6 @@ struct AudioContext {
     offset_known: Arc<AtomicBool>,
     blocks: mpsc::Sender<Input>,
     notes: mpsc::UnboundedSender<Note>,
-    local_offset_ms: f64,
 }
 
 /// One audio session: its worker thread.
@@ -563,7 +626,6 @@ async fn start_session(
         blocks: cx.blocks.clone(),
         notes: cx.notes.clone(),
         delay_ms,
-        local_offset_ms: cx.local_offset_ms,
         stop: stop.clone(),
     };
     let worker = match std::thread::Builder::new()
@@ -639,7 +701,6 @@ struct Worker {
     blocks: mpsc::Sender<Input>,
     notes: mpsc::UnboundedSender<Note>,
     delay_ms: u32,
-    local_offset_ms: f64,
     stop: Arc<AtomicBool>,
 }
 
@@ -696,7 +757,7 @@ impl Worker {
                         stamp,
                         self.delay_ms,
                         lookahead,
-                        self.local_offset_ms,
+                        self.shared.nudge_ms(),
                     ),
                     samples: *samples,
                 };
@@ -797,12 +858,14 @@ impl BlockAssembler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::SinkExt;
 
     #[test]
-    fn local_target_includes_lookahead() {
+    fn local_target_includes_lookahead_and_nudge() {
         // Without the lookahead the laptop is 6.5 ms ahead of every phone.
         assert_eq!(local_target_ms(1000.0, 1000, 312, 0.0), 2006.5);
-        assert_eq!(local_target_ms(1000.0, 1000, 312, 40.0), 2046.5);
+        // nudge -40 = 40 ms later (web model)
+        assert_eq!(local_target_ms(1000.0, 1000, 312, -40.0), 2046.5);
     }
 
     /// A chunk of `frames` stereo frames whose samples count up from `first_frame`.
@@ -912,5 +975,155 @@ mod tests {
             };
             assert_eq!(v, want, "frame {k}");
         }
+    }
+
+    /// Records the backend calls; `start` succeeds and keeps the audio ends like a real
+    /// backend.
+    #[derive(Default)]
+    struct FakeBackend {
+        calls: std::sync::Mutex<Vec<&'static str>>,
+        io: std::sync::Mutex<Option<AudioIo>>,
+    }
+
+    impl FakeBackend {
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        fn record(&self, call: &'static str) {
+            self.calls.lock().unwrap().push(call);
+        }
+    }
+
+    impl AudioBackend for FakeBackend {
+        fn list_apps(&self) -> Result<Vec<AppInfo>, AudioError> {
+            Ok(Vec::new())
+        }
+
+        fn start(&self, _apps: Vec<String>, io: AudioIo) -> Result<(), AudioError> {
+            self.record("start");
+            *self.io.lock().unwrap() = Some(io);
+            Ok(())
+        }
+
+        fn update_apps(&self, _apps: Vec<String>) -> Result<(), AudioError> {
+            self.record("update_apps");
+            Ok(())
+        }
+
+        fn stop(&self) -> Result<(), AudioError> {
+            self.record("stop");
+            self.io.lock().unwrap().take();
+            Ok(())
+        }
+    }
+
+    const WAIT: Duration = Duration::from_secs(4);
+
+    fn settings(server_url: String) -> Settings {
+        Settings {
+            server_url,
+            room_id: "123456".to_string(),
+            username: "alice".to_string(),
+            client_id: "me".to_string(),
+            ..Settings::default()
+        }
+    }
+
+    /// A local WebSocket server and the settings to join it.
+    async fn server() -> (tokio::net::TcpListener, Settings) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/ws", listener.local_addr().unwrap());
+        (listener, settings(url))
+    }
+
+    async fn accept(
+        listener: &tokio::net::TcpListener,
+    ) -> tokio_tungstenite::WebSocketStream<tokio::net::TcpStream> {
+        let (socket, _) = tokio::time::timeout(WAIT, listener.accept())
+            .await
+            .expect("the runtime connects")
+            .unwrap();
+        tokio_tungstenite::accept_async(socket).await.unwrap()
+    }
+
+    /// Polls `done` every few ms until it is true; panics after [`WAIT`].
+    async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let poll = async {
+            while !done() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        tokio::time::timeout(WAIT, poll)
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting until {what}"));
+    }
+
+    #[tokio::test]
+    async fn room_feed_receives_room_messages() {
+        let (listener, settings) = server().await;
+        let (feed_tx, mut feed_rx) = mpsc::unbounded_channel();
+        let backend = Arc::new(FakeBackend::default());
+        let handle = StreamerHandle::connect(settings, backend, JoinKind::App, Some(feed_tx)).await;
+        let mut ws = accept(&listener).await;
+        let text = r#"{"type":"ROOM_EVENT","event":{"type":"CLIENT_CHANGE","clients":[{"username":"bob","clientId":"b","isAdmin":true,"joinedAt":1}]}}"#;
+        ws.send(tokio_tungstenite::tungstenite::Message::text(text))
+            .await
+            .unwrap();
+        let message = tokio::time::timeout(WAIT, feed_rx.recv())
+            .await
+            .expect("the feed gets the message")
+            .unwrap();
+        assert_eq!(
+            message,
+            serde_json::from_str::<serde_json::Value>(text).unwrap()
+        );
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn actions_are_refused_while_disconnected() {
+        // A chat message or an admin change typed while the socket is down must show an
+        // error, not vanish.
+        let (listener, settings) = server().await;
+        drop(listener);
+        let backend = Arc::new(FakeBackend::default());
+        let handle = StreamerHandle::connect(settings, backend, JoinKind::App, None).await;
+        let chat = serde_json::json!({ "type": "SEND_CHAT_MESSAGE", "text": "hi" });
+        assert_eq!(handle.send_action(chat), Err("Not connected".to_string()));
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_connect_shows_the_reason_in_the_status() {
+        // A wrong but parsable server address: the sync screen must say why it waits.
+        let (listener, settings) = server().await;
+        drop(listener);
+        let backend = Arc::new(FakeBackend::default());
+        let handle = StreamerHandle::connect(settings, backend, JoinKind::App, None).await;
+        let status = handle.status();
+        wait_until("the status has the connect error", || {
+            status
+                .borrow()
+                .message
+                .as_deref()
+                .is_some_and(|m| m.starts_with("Cannot reach the server: "))
+        })
+        .await;
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_stops_the_audio_before_returning() {
+        // Leave while this PC streams: the join screen shows when `shutdown` returns, and the
+        // apps must not stay routed into the sink.
+        let (listener, settings) = server().await;
+        let backend = Arc::new(FakeBackend::default());
+        let handle = StreamerHandle::connect(settings, backend.clone(), JoinKind::App, None).await;
+        let _ws = accept(&listener).await;
+        handle.start(vec!["app".to_string()], 1000);
+        wait_until("the backend starts", || backend.calls().contains(&"start")).await;
+        handle.shutdown().await;
+        assert_eq!(backend.calls(), ["start", "stop"]);
     }
 }

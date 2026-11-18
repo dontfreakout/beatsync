@@ -35,6 +35,9 @@ pub enum ClientMessage {
         label: String,
     },
     StopLiveStream,
+    /// Asks for the room's playback state; while a track plays, the server answers this
+    /// client with a scheduled PLAY.
+    Sync,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -119,6 +122,10 @@ pub enum ClientKind {
     #[default]
     Web,
     Streamer,
+    App,
+    /// A kind added later: it must not break parsing of the client list.
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -129,6 +136,9 @@ pub struct ClientData {
     pub is_admin: bool,
     #[serde(default)]
     pub kind: ClientKind,
+    /// The nudge the server stores for this client (0 when absent).
+    #[serde(default)]
+    pub nudge_ms: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -147,4 +157,20 @@ pub struct LiveStream {
 pub enum RejectReason {
     NotAllowed,
     AlreadyActive,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_kind_app_and_unknown() {
+        let parse = |kind: &str| -> ClientKind {
+            let json =
+                format!(r#"{{"username":"a","clientId":"1","isAdmin":false,"kind":"{kind}"}}"#);
+            serde_json::from_str::<ClientData>(&json).unwrap().kind
+        };
+        assert_eq!(parse("app"), ClientKind::App);
+        assert_eq!(parse("tv"), ClientKind::Other); // a later kind must not break this build
+    }
 }

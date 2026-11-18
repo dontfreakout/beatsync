@@ -5,12 +5,17 @@
   "windows": ["main"],
   "permissions": [
     "core:default",
-    "allow-get-settings",
+    "allow-get-session",
     "allow-save-settings",
+    "allow-join-room",
+    "allow-leave-room",
+    "allow-set-nudge",
+    "allow-send-action",
     "allow-list-apps",
     "allow-start-stream",
     "allow-update-apps",
     "allow-stop-stream",
-    "allow-subscribe-status"
+    "allow-subscribe-status",
+    "allow-subscribe-room"
   ]
 }

@@ -159,6 +159,7 @@ name = "beatsync-streamer-app"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
  "streamer-core",
  "tauri",
  "tauri-build",

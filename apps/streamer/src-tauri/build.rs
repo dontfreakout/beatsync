@@ -1,13 +1,18 @@
 /// The app's commands. Each gets an `allow-…` permission; `capabilities/default.json` grants
 /// them to the main window (a command missing there is refused at run time).
 const COMMANDS: &[&str] = &[
-    "get_settings",
+    "get_session",
     "save_settings",
+    "join_room",
+    "leave_room",
+    "set_nudge",
+    "send_action",
     "list_apps",
     "start_stream",
     "update_apps",
     "stop_stream",
     "subscribe_status",
+    "subscribe_room",
 ];
 
 fn main() {

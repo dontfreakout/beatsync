@@ -26,6 +26,10 @@ pub enum Input {
     Connected,
     /// The WebSocket closed; routing and the local copy keep running.
     Disconnected,
+    /// A connect attempt failed with `error`; the connection tries again.
+    ConnectFailed {
+        error: String,
+    },
     Server(ServerMessage),
     /// One NTP response; `t3` is the client receive time.
     NtpResponse {
@@ -53,6 +57,10 @@ pub enum Input {
         apps: Vec<String>,
     },
     UserStop,
+    /// The user set a new nudge (positive plays the local copy earlier).
+    UserNudge {
+        nudge_ms: f64,
+    },
     AudioFailed {
         message: String,
     },
@@ -71,6 +79,11 @@ pub enum Output {
     SendProbePair {
         group_id: u64,
         client_rtt: Option<f64>,
+        client_nudge_ms: f64,
+    },
+    /// The nudge changed because the server's stored value was restored.
+    Nudge {
+        nudge_ms: f64,
     },
     /// Route the apps into the sink, start capture and the local copy.
     StartAudio {
@@ -102,6 +115,11 @@ pub struct Status {
     /// apps without a local copy.
     pub synced_once: bool,
     pub rtt_ms: Option<f64>,
+    /// Server offset of the last estimate; kept over a reconnect.
+    pub offset_ms: Option<f64>,
+    /// Accepted NTP measurements, 0..=16.
+    pub sync_measurements: usize,
+    pub nudge_ms: f64,
     pub listeners: usize,
     pub phase: Phase,
     pub message: Option<String>,
@@ -148,13 +166,26 @@ pub struct Engine {
     sequence: u32,
     clients: Vec<ClientData>,
     message: Option<String>,
+    /// The message of the last failed connect attempt; a connect clears it from `message`.
+    connect_error: Option<String>,
     volume: f64,
     spatial_gain: f64,
     last_status: Option<Status>,
+    nudge_ms: f64,
+    /// The server's stored nudge was restored, or the user set one: later CLIENT_CHANGEs
+    /// must not overwrite it (the web client's `shouldRestoreNudge`).
+    nudge_restored: bool,
+    /// The desktop app, like the web client: it restores the server's stored nudge once
+    /// (spec §6.2) and asks for the room's playback state (SYNC) once the clock is synced on
+    /// each connection (spec C7). The CLI does neither: its `--local-offset` wins, and it plays
+    /// no tracks.
+    is_app: bool,
+    /// SYNC was sent on the current connection.
+    room_sync_sent: bool,
 }
 
 impl Engine {
-    pub fn new(client_id: String, username: String) -> Self {
+    pub fn new(client_id: String, username: String, nudge_ms: f64, is_app: bool) -> Self {
         Self {
             client_id,
             username,
@@ -175,9 +206,14 @@ impl Engine {
             sequence: 0,
             clients: Vec::new(),
             message: None,
+            connect_error: None,
             volume: 1.0,
             spatial_gain: 1.0,
             last_status: None,
+            nudge_ms,
+            nudge_restored: false,
+            is_app,
+            room_sync_sent: false,
         }
     }
 
@@ -187,10 +223,21 @@ impl Engine {
             Input::Connected => {
                 self.reset_connection();
                 self.connected = true;
+                // The connect error is over; a message set since then stays.
+                if let Some(error) = self.connect_error.take()
+                    && self.message.as_ref() == Some(&error)
+                {
+                    self.message = None;
+                }
             }
             Input::Disconnected => {
                 self.reset_connection();
                 self.connected = false;
+            }
+            Input::ConnectFailed { error } => {
+                let message = format!("Cannot reach the server: {error}");
+                self.message = Some(message.clone());
+                self.connect_error = Some(message);
             }
             Input::Server(msg) => self.on_server(msg, &mut out),
             Input::NtpResponse {
@@ -228,6 +275,10 @@ impl Engine {
                 }
             }
             Input::UserStop => self.stop(&mut out),
+            Input::UserNudge { nudge_ms } => {
+                self.nudge_ms = nudge_ms;
+                self.nudge_restored = true;
+            }
             Input::AudioFailed { message } => {
                 self.stop(&mut out);
                 self.message = Some(message);
@@ -257,6 +308,7 @@ impl Engine {
     fn reset_connection(&mut self) {
         self.reset_ntp();
         self.start_sent = false;
+        self.room_sync_sent = false;
         // The old stream ended with the old socket.
         self.stop_pending_until_ms = None;
         if let Phase::Streaming { .. } = self.phase {
@@ -289,7 +341,10 @@ impl Engine {
         match msg {
             ServerMessage::LivenessPing => out.push(Output::SendJson(ClientMessage::LivenessPong)),
             ServerMessage::RoomEvent { event } => match event {
-                RoomEvent::ClientChange { clients } => self.clients = clients,
+                RoomEvent::ClientChange { clients } => {
+                    self.clients = clients;
+                    self.restore_nudge(out);
+                }
                 RoomEvent::LiveStreamState {
                     stream,
                     stopped_by_client_id,
@@ -302,6 +357,24 @@ impl Engine {
             ServerMessage::LiveStreamRejected { reason } => self.on_rejected(reason, out),
             // NTP responses come as `Input::NtpResponse` with the receive time.
             ServerMessage::NtpResponse { .. } | ServerMessage::Other => {}
+        }
+    }
+
+    /// The server keeps a nonzero nudge of this client from an earlier session: the app takes
+    /// it once.
+    fn restore_nudge(&mut self, out: &mut Vec<Output>) {
+        if !self.is_app || self.nudge_restored {
+            return;
+        }
+        let stored = self
+            .clients
+            .iter()
+            .find(|c| c.client_id == self.client_id)
+            .map_or(0.0, |c| c.nudge_ms);
+        if stored != 0.0 {
+            self.nudge_restored = true;
+            self.nudge_ms = stored;
+            out.push(Output::Nudge { nudge_ms: stored });
         }
     }
 
@@ -335,12 +408,14 @@ impl Engine {
         {
             self.stop_pending_until_ms = None;
         }
+        self.request_room_sync_when_synced(out);
         if !self.connected || self.next_probe_ms.is_some_and(|due| now_ms < due) {
             return;
         }
         out.push(Output::SendProbePair {
             group_id: self.next_group_id,
             client_rtt: self.estimator.avg_rtt_ms(),
+            client_nudge_ms: self.nudge_ms,
         });
         self.next_group_id += 1;
         let interval_ms = if self.estimator.is_synced() {
@@ -349,6 +424,15 @@ impl Engine {
             INITIAL_INTERVAL_MS
         };
         self.next_probe_ms = Some(now_ms + interval_ms as f64);
+    }
+
+    /// SYNC once per connection, at the first tick with a synced clock: while a track plays,
+    /// the server answers with a PLAY scheduled in server time, which needs the synced clock.
+    fn request_room_sync_when_synced(&mut self, out: &mut Vec<Output>) {
+        if self.is_app && self.connected && !self.room_sync_sent && self.estimator.is_synced() {
+            self.room_sync_sent = true;
+            out.push(Output::SendJson(ClientMessage::Sync));
+        }
     }
 
     /// While `Starting`, only our own state or REJECTED decides: a null or foreign state may be
@@ -488,6 +572,9 @@ impl Engine {
             synced: self.estimator.is_synced(),
             synced_once: self.synced_once,
             rtt_ms: self.estimator.avg_rtt_ms(),
+            offset_ms: self.last_offset_ms,
+            sync_measurements: self.estimator.measurements(),
+            nudge_ms: self.nudge_ms,
             listeners: self
                 .clients
                 .iter()
@@ -553,8 +640,26 @@ mod tests {
     impl Harness {
         /// Engine for client `ME` named "alice", not connected.
         fn new() -> Self {
+            Self::with_nudge(0.0)
+        }
+
+        fn with_nudge(nudge_ms: f64) -> Self {
+            Self::with_engine(Engine::new(ME.into(), "alice".into(), nudge_ms, false))
+        }
+
+        /// Like [`Self::new`], for the desktop app: it restores the server's nudge and
+        /// requests the room's playback state.
+        fn app() -> Self {
+            Self::app_with_nudge(0.0)
+        }
+
+        fn app_with_nudge(nudge_ms: f64) -> Self {
+            Self::with_engine(Engine::new(ME.into(), "alice".into(), nudge_ms, true))
+        }
+
+        fn with_engine(engine: Engine) -> Self {
             Self {
-                engine: Engine::new(ME.into(), "alice".into()),
+                engine,
                 now_ms: 1_000_000.0,
                 status: None,
             }
@@ -697,11 +802,47 @@ mod tests {
                 client_id: id.to_string(),
                 is_admin: false,
                 kind: ClientKind::Web,
+                nudge_ms: 0.0,
             })
             .collect();
         ServerMessage::RoomEvent {
             event: RoomEvent::ClientChange { clients },
         }
+    }
+
+    /// A CLIENT_CHANGE whose only client is this one, with the server's stored `nudge_ms`.
+    fn own_client_change(nudge_ms: f64) -> ServerMessage {
+        ServerMessage::RoomEvent {
+            event: RoomEvent::ClientChange {
+                clients: vec![ClientData {
+                    username: "alice".into(),
+                    client_id: ME.into(),
+                    is_admin: false,
+                    kind: ClientKind::App,
+                    nudge_ms,
+                }],
+            },
+        }
+    }
+
+    fn nudges(out: &[Output]) -> Vec<f64> {
+        out.iter()
+            .filter_map(|o| match o {
+                Output::Nudge { nudge_ms } => Some(*nudge_ms),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn probe_nudges(out: &[Output]) -> Vec<f64> {
+        out.iter()
+            .filter_map(|o| match o {
+                Output::SendProbePair {
+                    client_nudge_ms, ..
+                } => Some(*client_nudge_ms),
+                _ => None,
+            })
+            .collect()
     }
 
     fn scheduled(action: ScheduledAction) -> ServerMessage {
@@ -748,6 +889,7 @@ mod tests {
                 Output::SendProbePair {
                     group_id,
                     client_rtt,
+                    ..
                 } => Some((*group_id, *client_rtt)),
                 _ => None,
             })
@@ -761,6 +903,12 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    fn room_syncs(out: &[Output]) -> usize {
+        out.iter()
+            .filter(|o| matches!(o, Output::SendJson(ClientMessage::Sync)))
+            .count()
     }
 
     fn starts(out: &[Output]) -> Vec<&ClientMessage> {
@@ -1226,6 +1374,9 @@ mod tests {
             synced: false,
             synced_once: false,
             rtt_ms: None,
+            offset_ms: None,
+            sync_measurements: 0,
+            nudge_ms: 0.0,
             listeners: 0,
             phase: Phase::Idle,
             message: None,
@@ -1279,5 +1430,153 @@ mod tests {
         assert_eq!(label(&[&format!("{}🎵", "a".repeat(99))]), "a".repeat(99));
         let accents = "é".repeat(100);
         assert_eq!(label(&[&accents]), accents);
+    }
+
+    #[test]
+    fn probe_pairs_carry_the_nudge() {
+        let mut h = Harness::with_nudge(20.0);
+        h.feed(Input::Connected);
+        let first = h.tick(h.now_ms + 10.0);
+        assert_eq!(probe_nudges(&first), vec![20.0]);
+        h.feed(Input::UserNudge { nudge_ms: -10.0 });
+        let next = h.tick(h.now_ms + 60.0);
+        assert_eq!(probe_nudges(&next), vec![-10.0]);
+    }
+
+    #[test]
+    fn the_server_nudge_is_restored_once() {
+        let mut h = Harness::app();
+        h.feed(Input::Connected);
+        let out = h.server(own_client_change(30.0));
+        assert_eq!(nudges(&out), vec![30.0]);
+        assert_eq!(h.status().nudge_ms, 30.0);
+        let out = h.server(own_client_change(50.0));
+        assert!(nudges(&out).is_empty());
+        assert_eq!(h.status().nudge_ms, 30.0);
+    }
+
+    #[test]
+    fn the_cli_never_restores_the_server_nudge() {
+        // Spec §6.2: the app restores the stored nudge; the CLI's `--local-offset` wins.
+        let mut h = Harness::with_nudge(20.0);
+        h.feed(Input::Connected);
+        let out = h.server(own_client_change(30.0));
+        assert!(nudges(&out).is_empty());
+        assert_eq!(h.status().nudge_ms, 20.0);
+    }
+
+    #[test]
+    fn a_zero_server_nudge_is_not_restored() {
+        let mut h = Harness::app_with_nudge(20.0);
+        h.feed(Input::Connected);
+        let out = h.server(own_client_change(0.0));
+        assert!(nudges(&out).is_empty());
+        assert_eq!(h.status().nudge_ms, 20.0);
+    }
+
+    #[test]
+    fn a_user_nudge_is_not_overwritten_by_a_stale_client_change() {
+        let mut h = Harness::app();
+        h.feed(Input::Connected);
+        h.feed(Input::UserNudge { nudge_ms: 15.0 });
+        let out = h.server(own_client_change(5.0));
+        assert!(nudges(&out).is_empty());
+        assert_eq!(h.status().nudge_ms, 15.0);
+    }
+
+    #[test]
+    fn a_failed_connect_shows_the_reason_until_connected() {
+        // A wrong but parsable server address gave "Connecting..." forever with no reason.
+        let mut h = Harness::new();
+        h.feed(Input::ConnectFailed {
+            error: "Connection refused".into(),
+        });
+        assert_eq!(
+            h.message(),
+            Some("Cannot reach the server: Connection refused")
+        );
+        h.feed(Input::Connected);
+        assert_eq!(h.message(), None);
+
+        // A connect clears only the connect error: a message set after it stays.
+        h.feed(Input::Disconnected);
+        h.feed(Input::ConnectFailed {
+            error: "Connection refused".into(),
+        });
+        h.feed(user_start(&["Spotify"]));
+        h.feed(Input::AudioFailed {
+            message: "no sink".into(),
+        });
+        h.feed(Input::Connected);
+        assert_eq!(h.message(), Some("no sink"));
+    }
+
+    #[test]
+    fn status_reports_sync_measurements_and_offset() {
+        let mut h = Harness::connected();
+        assert_eq!(h.status().sync_measurements, 0);
+        assert_eq!(h.status().offset_ms, None);
+        h.probe_pairs(3);
+        assert_eq!(h.status().sync_measurements, 3);
+        assert_eq!(h.status().offset_ms, Some(500.0));
+        h.probe_pairs(13);
+        assert_eq!(h.status().sync_measurements, 16);
+        // A 17th measurement does not raise the count.
+        let tick = h.tick(h.now_ms + STEADY_INTERVAL_MS as f64);
+        let [(group_id, _)] = probes(&tick)[..] else {
+            panic!("a steady probe pair is due: {tick:?}");
+        };
+        h.answer(group_id, 20.0, 500.0);
+        assert_eq!(h.status().sync_measurements, 16);
+    }
+
+    #[test]
+    fn sync_is_requested_once_per_connection_after_the_clock_syncs() {
+        // Spec C7: like the web client, the app asks for the playback state once its clock is
+        // synced; while a track plays, the server answers with a PLAY scheduled in server
+        // time. One request per connection; a new connection asks again.
+        let mut h = Harness::app();
+        h.feed(Input::Connected);
+        let mut out = h.probe_pairs(15);
+        // The 16th pair goes out at 15 measurements.
+        out.extend(h.probe_pairs(1));
+        assert_eq!(room_syncs(&out), 0, "not synced before 16 measurements");
+        assert!(h.status().synced);
+        let out = h.tick(h.now_ms + 10.0);
+        assert_eq!(room_syncs(&out), 1, "{out:?}");
+
+        let mut later = Vec::new();
+        for _ in 0..3 {
+            later.extend(h.tick(h.now_ms + STEADY_INTERVAL_MS as f64));
+        }
+        // A clock step resyncs on the same connection.
+        later.extend(h.feed(Input::ClockStepped { delta_ms: 1000.0 }));
+        later.extend(h.sync());
+        later.extend(h.tick(h.now_ms + 10.0));
+        assert!(h.status().synced);
+        assert_eq!(room_syncs(&later), 0, "once per connection");
+
+        h.feed(Input::Disconnected);
+        h.feed(Input::Connected);
+        let mut out = h.sync();
+        assert_eq!(room_syncs(&out), 0, "not synced on the new connection yet");
+        out.extend(h.tick(h.now_ms + 10.0));
+        out.extend(h.tick(h.now_ms + STEADY_INTERVAL_MS as f64));
+        assert_eq!(room_syncs(&out), 1, "once more on the new connection");
+    }
+
+    #[test]
+    fn the_cli_never_requests_sync() {
+        // The CLI keeps its behavior: it shows no room and plays no tracks.
+        let mut h = Harness::new();
+        h.feed(Input::Connected);
+        let mut out = h.sync();
+        out.extend(h.tick(h.now_ms + 10.0));
+        h.feed(Input::Disconnected);
+        h.feed(Input::Connected);
+        out.extend(h.sync());
+        out.extend(h.tick(h.now_ms + 10.0));
+        assert!(h.status().synced);
+        assert_eq!(room_syncs(&out), 0);
     }
 }

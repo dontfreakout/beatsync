@@ -11,6 +11,7 @@ import type {
   AudioSourceType,
   ChatMessageType,
   ClientDataType,
+  ClientKind,
   DiscoveryRoomType,
   LiveStreamType,
   PauseActionType,
@@ -96,6 +97,11 @@ interface PendingPlayState {
  * RoomManager handles all operations for a single room.
  * Each room has its own instance of RoomManager.
  */
+// Web and app clients have an admin UI. Streamers do not, so they are never promoted and never count as admin.
+function hasAdminUi(kind: ClientKind): boolean {
+  return kind === "web" || kind === "app";
+}
+
 export class RoomManager {
   private static readonly AUDIO_LOAD_TIMEOUT_MS = 3000; // 3 seconds max wait for audio loading
   // Liveness policy. NTP recency can't be used for liveness: backgrounded tabs have
@@ -219,7 +225,8 @@ export class RoomManager {
       return false;
     }
 
-    // Streamer clients never load queue tracks, so only web clients are waited for
+    // Streamer clients never load queue tracks, so only web clients are waited for.
+    // `app` clients are waited for from part 3 (they cannot load tracks yet).
     const webClients = this.getClients().filter((client) => client.kind === "web");
     // Don't start playback if there are no web clients
     if (webClients.length === 0) {
@@ -441,11 +448,11 @@ export class RoomManager {
     }
 
     // In demo mode, only the admin secret grants admin. Otherwise the first connection gets admin, and a web client
-    // also gets admin when no other connected web client is admin (a streamer may hold admin but has no admin UI).
+    // also gets admin when no other connected client with an admin UI (web or app) is admin (a streamer may hold admin but has no admin UI).
     if (!IS_DEMO_MODE) {
       const firstConnection = this.wsConnections.size === 0;
-      const noWebAdmin = !this.getClients().some((client) => client.kind === "web" && client.isAdmin);
-      if (firstConnection || (clientData.kind === "web" && noWebAdmin)) {
+      const noAdminUiAdmin = !this.getClients().some((client) => hasAdminUi(client.kind) && client.isAdmin);
+      if (firstConnection || (hasAdminUi(clientData.kind) && noAdminUiAdmin)) {
         clientData.isAdmin = true;
       }
     }
@@ -495,13 +502,13 @@ export class RoomManager {
       // In demo mode, skip auto-promotion — only the admin secret grants admin
       if (!IS_DEMO_MODE) {
         // Streamers are never promoted and do not count: they have no admin UI
-        const webClients = activeClients.filter((client) => client.kind === "web");
-        const remainingAdmins = webClients.filter((client) => client.isAdmin);
+        const adminUiClients = activeClients.filter((client) => hasAdminUi(client.kind));
+        const remainingAdmins = adminUiClients.filter((client) => client.isAdmin);
 
-        if (webClients.length > 0 && remainingAdmins.length === 0) {
+        if (adminUiClients.length > 0 && remainingAdmins.length === 0) {
           // Promote the most recently active client — promoting a backgrounded
           // lurker could leave a room where nobody present can control playback
-          const newAdmin = webClients.reduce((a, b) => (a.lastSeenAt >= b.lastSeenAt ? a : b));
+          const newAdmin = adminUiClients.reduce((a, b) => (a.lastSeenAt >= b.lastSeenAt ? a : b));
 
           newAdmin.isAdmin = true;
           this.clientData.set(newAdmin.clientId, newAdmin);

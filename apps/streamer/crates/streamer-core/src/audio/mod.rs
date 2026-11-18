@@ -95,11 +95,19 @@ pub struct PlayoutShared {
     pub gain: AtomicU32,
     /// f32 bits: ramp duration of gain changes, in s.
     pub gain_ramp_s: AtomicU32,
+    /// f64 bits: the nudge in ms (positive plays the local copy earlier). The worker reads it
+    /// for every block.
+    pub nudge_ms: AtomicU64,
     /// Captured chunks the capture callback dropped (full ring or no timing).
     pub capture_dropped: AtomicU64,
 }
 
 impl PlayoutShared {
+    /// Real-time safe.
+    pub fn nudge_ms(&self) -> f64 {
+        f64::from_bits(self.nudge_ms.load(Ordering::Relaxed))
+    }
+
     /// Server time in ms of a CLOCK_MONOTONIC time. Real-time safe.
     pub fn mono_to_server_ms(&self, mono_ns: i64) -> f64 {
         let offset_ms = f64::from_bits(self.mono_server_offset_ms.load(Ordering::Relaxed));

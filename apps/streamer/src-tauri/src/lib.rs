@@ -5,6 +5,7 @@
 //! process ends.
 
 mod commands;
+mod room_hub;
 
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -21,18 +22,22 @@ const EXIT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(15);
 pub fn run() {
     let app = tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
-            commands::get_settings,
+            commands::get_session,
             commands::save_settings,
+            commands::join_room,
+            commands::leave_room,
+            commands::set_nudge,
+            commands::send_action,
             commands::list_apps,
             commands::start_stream,
             commands::update_apps,
             commands::stop_stream,
             commands::subscribe_status,
+            commands::subscribe_room,
         ])
         .setup(|app| {
-            let state = AppState::new();
-            tauri::async_runtime::block_on(state.connect());
-            app.manage(state);
+            // Nothing connects until the window joins a room.
+            app.manage(AppState::new());
             watch_signals(app.handle().clone());
             Ok(())
         })

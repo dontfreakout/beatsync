@@ -1,6 +1,7 @@
 import { DEMO_ROOM_ID, IS_DEMO_MODE, isValidAdminSecret } from "@/demo";
 import { errorResponse } from "@/utils/responses";
 import type { BunServer, WSData } from "@/utils/websocket";
+import { parseClientKind } from "@/utils/websocket";
 
 const CREATOR_SECRET = process.env.CREATOR_SECRET;
 
@@ -44,7 +45,7 @@ export const handleWebSocketUpgrade = (req: Request, server: BunServer) => {
     clientId,
     isAdmin,
     isCreator,
-    kind: url.searchParams.get("kind") === "streamer" ? "streamer" : "web",
+    kind: parseClientKind(url.searchParams.get("kind")),
   };
 
   // Upgrade the connection with the WSData context
