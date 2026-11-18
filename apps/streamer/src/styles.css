@@ -5,7 +5,9 @@
   --muted: #71717a;
   --line: #d4d4d8;
   --field: #ffffff;
-  --accent: #16a34a;
+  /* Contrast at least 4.5:1: --on-accent on --accent, and --accent on --bg. */
+  --accent: #15803d;
+  --on-accent: #ffffff;
   --error: #dc2626;
   --warning: #b45309;
   font-family: system-ui, sans-serif;
@@ -21,6 +23,7 @@
     --line: #3f3f46;
     --field: #27272a;
     --accent: #22c55e;
+    --on-accent: #18181b;
     --error: #f87171;
     --warning: #fbbf24;
   }
@@ -100,7 +103,7 @@ button:disabled {
 button.primary {
   border-color: var(--accent);
   background: var(--accent);
-  color: #ffffff;
+  color: var(--on-accent);
   font-weight: 600;
 }
 
