@@ -1,0 +1,21 @@
+[package]
+name = "beatsync-streamer-app"
+version = "0.1.0"
+description = "Beatsync Streamer: streams the audio of local apps into a beatsync room"
+edition = "2024"
+rust-version = "1.90"
+publish = false
+
+# Desktop only: no mobile targets, so no staticlib/cdylib.
+[lib]
+name = "streamer_app_lib"
+crate-type = ["rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+streamer-core = { path = "../crates/streamer-core" }
+tauri = { version = "2", features = [] }
+serde = { version = "1.0.229", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "signal", "sync", "time"] }
