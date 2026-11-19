@@ -1,5 +1,6 @@
-//! The local copy (spec §9.6): plays the raw PCM blocks so that each frame is heard at its
-//! target server time, measured against PipeWire's output timing.
+//! The output (spec §9.6): the one playback stream of a connection. Its callback is the
+//! [`Mixer`], which plays every frame at its target server time, measured against PipeWire's
+//! output timing.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -12,47 +13,31 @@ use pw::stream::{Stream, StreamState};
 
 use super::OWN_APP_NAME;
 use super::media::{
-    self, CHANNELS, LATENCY, MediaStream, RATE, STRIDE, StreamSpec, Timing, frames_to_ns,
+    self, CHANNELS, LATENCY, MediaStream, STRIDE, StreamSpec, Timing, frames_to_ns,
 };
 use super::routing::is_own_sink;
 use crate::audio::PlayoutShared;
 use crate::clock::mono_ns;
-use crate::gain::GainRamp;
-use crate::playout::{BlockSource, PcmBlock, Playout, PlayoutConfig};
+use crate::mixer::{Mixer, RENDER_FRAMES};
 
 pub(super) const PLAYBACK_NAME: &str = "beatsync-local";
 
-/// The failure when the local copy would play into the streamer's own sink.
+/// The failure of a stream start when the output would play into the streamer's own sink.
 pub(super) const NO_LOCAL_OUTPUT: &str = "No audio output device for the local copy";
-
-/// Frames rendered per `Playout::fill` call; longer buffers take several calls.
-const PIECE_FRAMES: usize = 1024;
 
 pub(super) type PlaybackStream = MediaStream<PlaybackState>;
 
 /// The real-time state of the playback callback.
 pub(super) struct PlaybackState {
-    rx: rtrb::Consumer<PcmBlock>,
+    mixer: Mixer,
     shared: Arc<PlayoutShared>,
-    playout: Playout,
-    gain: GainRamp,
-    pcm: Box<[f32; PIECE_FRAMES * CHANNELS]>,
+    pcm: Box<[f32; RENDER_FRAMES * CHANNELS]>,
 }
 
-impl BlockSource for rtrb::Consumer<PcmBlock> {
-    fn peek(&mut self) -> Option<&PcmBlock> {
-        rtrb::Consumer::peek(self).ok()
-    }
-
-    fn pop(&mut self) {
-        let _ = rtrb::Consumer::pop(self);
-    }
-}
-
-/// Whether the local copy may play to the default output: not when that is one of this
-/// process's sinks, because the copy would loop into the capture (ruling R11-8).
-/// `default_audio_sink` is the `default.audio.sink` value of the `default` metadata,
-/// `{"name":"<node.name>"}`.
+/// Whether the output may play to the default output while this process streams: not when
+/// that is one of this process's sinks, because the output would loop into the capture
+/// (ruling R11-8). `default_audio_sink` is the `default.audio.sink` value of the `default`
+/// metadata, `{"name":"<node.name>"}`.
 pub(super) fn local_copy_allowed(default_audio_sink: Option<&str>, own_pid: u32) -> bool {
     let Some(value) = default_audio_sink else {
         return true;
@@ -87,12 +72,13 @@ fn playback_properties(target: Option<&str>) -> PropertiesBox {
     props
 }
 
-/// Plays the blocks of `rx` at their target server time. Without `target` (a `node.name`) the
-/// stream goes to the default output and follows it when it changes.
+/// Plays `mixer` so that its frames are heard at their server time (`shared` maps the
+/// output's clock to server time). Without `target` (a `node.name`) the stream goes to the
+/// default output and follows it when it changes.
 pub(super) fn connect_playback(
     core: &CoreRc,
     target: Option<&str>,
-    rx: rtrb::Consumer<PcmBlock>,
+    mixer: Mixer,
     shared: Arc<PlayoutShared>,
     id: u64,
     on_state: impl FnMut(StreamState) + 'static,
@@ -103,13 +89,10 @@ pub(super) fn connect_playback(
         direction: Direction::Output,
         id,
     };
-    let gain = GainRamp::new(f32::from_bits(shared.gain.load(Ordering::Relaxed)));
     let state = PlaybackState {
-        rx,
+        mixer,
         shared,
-        playout: Playout::new(PlayoutConfig::default()),
-        gain,
-        pcm: Box::new([0.0; PIECE_FRAMES * CHANNELS]),
+        pcm: Box::new([0.0; RENDER_FRAMES * CHANNELS]),
     };
     media::connect(core, spec, state, process, on_state)
 }
@@ -131,24 +114,31 @@ pub(super) fn heard_at_mono_ns(t: &Timing, now_ns: i64) -> i64 {
 }
 
 impl PlaybackState {
-    /// Fills `out` (interleaved F32LE stereo) with the frames due from `heard_at_ns` on.
+    /// Fills `out` (interleaved F32LE stereo) with the frames heard from `heard_at_ns` on.
     fn render(&mut self, out: &mut [u8], heard_at_ns: i64) {
-        let gain = f32::from_bits(self.shared.gain.load(Ordering::Relaxed));
-        let ramp_s = f32::from_bits(self.shared.gain_ramp_s.load(Ordering::Relaxed));
-        self.gain.set_target(gain, ramp_s, RATE as f32);
         let mut done = 0;
-        for part in out.chunks_mut(PIECE_FRAMES * STRIDE) {
+        for part in out.chunks_mut(RENDER_FRAMES * STRIDE) {
             let frames = part.len() / STRIDE;
             let pcm = &mut self.pcm[..frames * CHANNELS];
             let at_ns = heard_at_ns + frames_to_ns(done as u64).round() as i64;
-            let at_server_ms = self.shared.mono_to_server_ms(at_ns);
-            self.playout.fill(pcm, at_server_ms, &mut self.rx);
-            self.gain.apply(pcm, CHANNELS);
+            self.mixer.render(pcm, self.shared.mono_to_server_ms(at_ns));
             for (le, sample) in part.as_chunks_mut::<4>().0.iter_mut().zip(pcm.iter()) {
                 *le = sample.to_le_bytes();
             }
             done += frames;
         }
+    }
+}
+
+/// Stores how far ahead of `now_ns` the first frame of this cycle is heard: the track feeder
+/// keeps its blocks ahead of what the output renders, and the app reports it to the server.
+/// A cycle without timing keeps the last value. Real-time safe.
+fn publish_render_ahead(shared: &PlayoutShared, heard_at_ns: Option<i64>, now_ns: i64) {
+    if let Some(at) = heard_at_ns {
+        let ahead_ms = (at - now_ns) as f64 / 1e6;
+        shared
+            .render_ahead_ms
+            .store(ahead_ms.to_bits(), Ordering::Relaxed);
     }
 }
 
@@ -161,7 +151,9 @@ fn process(stream: &Stream, st: &mut PlaybackState) {
     let Some(data) = buffer.datas_mut().first_mut() else {
         return;
     };
-    let heard_at = Timing::of(stream).map(|t| heard_at_mono_ns(&t, mono_ns()));
+    let now_ns = mono_ns();
+    let heard_at = Timing::of(stream).map(|t| heard_at_mono_ns(&t, now_ns));
+    publish_render_ahead(&st.shared, heard_at, now_ns);
     let frames = match data.data() {
         Some(bytes) => {
             let capacity = bytes.len() / STRIDE;
@@ -175,8 +167,8 @@ fn process(stream: &Stream, st: &mut PlaybackState) {
                 Some(at) => st.render(out, at),
                 None => {
                     out.fill(0);
-                    // The cursor did not move: realign exactly at the next timed cycle.
-                    st.playout.reset();
+                    // The slots did not move: realign exactly at the next timed cycle.
+                    st.mixer.reset();
                 }
             }
             frames
@@ -214,6 +206,20 @@ mod tests {
     }
 
     #[test]
+    fn a_cycle_without_timing_keeps_the_render_ahead() {
+        // The feeder and the server report use the last measured delay; a cycle without
+        // timing must not make it 0.
+        let shared = PlayoutShared::default();
+        let ahead = || f64::from_bits(shared.render_ahead_ms.load(Ordering::Relaxed));
+        publish_render_ahead(&shared, Some(1_030 * MS), 1_000 * MS);
+        assert_eq!(ahead(), 30.0);
+        publish_render_ahead(&shared, None, 1_020 * MS);
+        assert_eq!(ahead(), 30.0);
+        publish_render_ahead(&shared, Some(1_062 * MS), 1_040 * MS);
+        assert_eq!(ahead(), 22.0);
+    }
+
+    #[test]
     fn local_copy_never_plays_into_own_sink() {
         let pid = 4242;
         let json = |name: &str| format!(r#"{{"name":"{name}"}}"#);
@@ -232,12 +238,12 @@ mod tests {
 
     /// End-to-end check of both timing rules against a live PipeWire (ignored; run with
     /// `cargo test -p streamer-core -- --ignored loopback`). Each of two test null sinks gets a
-    /// loopback: the production playback stream plays clicks scheduled through `Playout` into
-    /// the sink, and the production capture stream on the sink's monitor stamps them. The two
+    /// loopback: the production output plays clicks scheduled in both mixer slots into the
+    /// sink, and the production capture stream on the sink's monitor stamps them. The two
     /// sinks drive independent graphs at different quanta (512 and 2048 frames), so the rules
     /// are checked at two cycle phases and buffer sizes, one of them split into chunks.
-    /// Nothing is audible: the playback is pinned to a test sink with `node.dont-fallback`,
-    /// and the test checks its links before any click is queued.
+    /// Nothing is audible: the output is pinned to a test sink with `node.dont-fallback`, and
+    /// the test checks its links before any click is queued.
     mod loopback {
         use std::cell::RefCell;
         use std::rc::Rc;
@@ -256,16 +262,26 @@ mod tests {
         use crate::audio::pipewire::capture::{CaptureStream, connect_capture};
         use crate::audio::pipewire::playback::{PLAYBACK_NAME, PlaybackStream, connect_playback};
         use crate::audio::pipewire::routing::sink_properties;
-        use crate::audio::pipewire::tests::{links_from, lock, nodes, wait_until};
+        use crate::audio::pipewire::tests::{lock, nodes, own_links, wait_until};
         use crate::audio::{CapturedChunk, PlayoutShared};
         use crate::clock::{MonoEpochMap, mono_ns};
+        use crate::dsp::Metronome;
+        use crate::mixer::{Mixer, Slot};
         use crate::playout::{BLOCK_SAMPLES, PcmBlock};
 
-        /// Blocks per loopback (800 ms), contiguous from the first target time.
+        /// Blocks per slot (800 ms), contiguous from the slot's first target time.
         const BLOCKS: u64 = 40;
         /// Blocks that carry a click, at frame [`CLICK_FRAME`].
         const CLICK_BLOCKS: [u64; 4] = [5, 15, 25, 35];
         const CLICK_FRAME: usize = 333;
+        /// The track slot's blocks start this much after the stream slot's: the clicks of the
+        /// two slots alternate, at least 96 ms apart, at another phase within a block.
+        const TRACK_OFFSET_MS: f64 = 103.7;
+        /// A captured frame louder than this is a click.
+        const THRESHOLD: f32 = 0.25;
+        /// The low-pass rings for a few frames after a click; frames this close to the last
+        /// onset belong to it.
+        const ONSET_GAP_NS: i64 = 10_000_000;
         const MAX_ERROR_MS: f64 = 2.0;
         /// Quantum of each test sink's graph: a common one, and one above
         /// [`crate::audio::CHUNK_MAX_FRAMES`], so captured buffers are split.
@@ -277,11 +293,14 @@ mod tests {
             capture: CaptureStream,
             playback: PlaybackStream,
             captured: rtrb::Consumer<CapturedChunk>,
-            blocks: rtrb::Producer<PcmBlock>,
+            /// The producers of the stream and the track slot.
+            slots: [rtrb::Producer<PcmBlock>; 2],
             shared: Arc<PlayoutShared>,
             states: Rc<RefCell<[Option<StreamState>; 2]>>,
-            expected_ms: Vec<f64>,
+            /// The scheduled clicks in time order, with their slot.
+            expected: Vec<(Slot, f64)>,
             measured_ms: Vec<f64>,
+            last_onset_ns: Option<i64>,
         }
 
         impl Loopback {
@@ -290,22 +309,28 @@ mod tests {
                 states.iter().all(|s| *s == Some(StreamState::Streaming))
             }
 
-            /// Queues contiguous blocks from `first_ms` (server time) with the clicks.
+            /// Queues contiguous blocks with the clicks in each slot, from `first_ms` (server
+            /// time) in the stream slot and [`TRACK_OFFSET_MS`] later in the track slot.
             fn schedule(&mut self, first_ms: f64) {
-                for n in 0..BLOCKS {
-                    let mut samples = [0.0; BLOCK_SAMPLES];
-                    let target = first_ms + n as f64 * 20.0;
-                    if CLICK_BLOCKS.contains(&n) {
-                        samples[CLICK_FRAME * 2] = 1.0;
-                        samples[CLICK_FRAME * 2 + 1] = 1.0;
-                        self.expected_ms.push(target + CLICK_FRAME as f64 / 48.0);
+                for (slot, offset_ms) in [(Slot::Stream, 0.0), (Slot::Track, TRACK_OFFSET_MS)] {
+                    for n in 0..BLOCKS {
+                        let mut samples = [0.0; BLOCK_SAMPLES];
+                        let target = first_ms + offset_ms + n as f64 * 20.0;
+                        if CLICK_BLOCKS.contains(&n) {
+                            samples[CLICK_FRAME * 2] = 1.0;
+                            samples[CLICK_FRAME * 2 + 1] = 1.0;
+                            self.expected
+                                .push((slot, target + CLICK_FRAME as f64 / 48.0));
+                        }
+                        let block = PcmBlock {
+                            target_start_server_ms: target,
+                            samples,
+                        };
+                        let pushed = self.slots[slot as usize].push(block);
+                        assert!(pushed.is_ok(), "the {slot:?} ring has room");
                     }
-                    let block = PcmBlock {
-                        target_start_server_ms: target,
-                        samples,
-                    };
-                    assert!(self.blocks.push(block).is_ok(), "playout ring has room");
                 }
+                self.expected.sort_by(|a, b| a.1.total_cmp(&b.1));
             }
 
             /// Stamps every click onset in the captured chunks with the capture rule.
@@ -313,13 +338,31 @@ mod tests {
                 while let Ok(chunk) = self.captured.pop() {
                     let frames = chunk.samples[..chunk.frames * 2].as_chunks::<2>().0;
                     for (k, frame) in frames.iter().enumerate() {
-                        if frame[0].abs() > 0.25 {
-                            let offset = k as f64 * 1e9 / 48_000.0;
-                            let mono = chunk.mono_ns_first_frame + offset.round() as i64;
-                            self.measured_ms.push(self.shared.mono_to_server_ms(mono));
+                        if frame[0].abs() <= THRESHOLD {
+                            continue;
                         }
+                        let offset = k as f64 * 1e9 / 48_000.0;
+                        let mono = chunk.mono_ns_first_frame + offset.round() as i64;
+                        if self
+                            .last_onset_ns
+                            .is_some_and(|last| mono - last < ONSET_GAP_NS)
+                        {
+                            continue;
+                        }
+                        self.last_onset_ns = Some(mono);
+                        self.measured_ms.push(self.shared.mono_to_server_ms(mono));
                     }
                 }
+            }
+
+            /// Measured − scheduled, in ms, of the clicks of `slot`.
+            fn errors(&self, slot: Slot) -> Vec<f64> {
+                self.measured_ms
+                    .iter()
+                    .zip(&self.expected)
+                    .filter(|(_, (s, _))| *s == slot)
+                    .map(|(m, (_, e))| m - e)
+                    .collect()
             }
 
             /// Frames per cycle the capture saw (`pw_time.size`).
@@ -418,7 +461,10 @@ mod tests {
                     store(&shared.mono_server_offset_ms, epoch_offset_ms);
                     shared.gain.store(1.0_f32.to_bits(), Ordering::Relaxed);
                     let (capture_tx, captured) = rtrb::RingBuffer::new(256);
-                    let (blocks, playout_rx) = rtrb::RingBuffer::new(64);
+                    let (stream_tx, stream_rx) = rtrb::RingBuffer::new(64);
+                    let (track_tx, track_rx) = rtrb::RingBuffer::new(64);
+                    let metronome = Metronome::kick().expect("kick");
+                    let mixer = Mixer::new(stream_rx, track_rx, metronome, shared.clone(), true);
                     let states = Rc::new(RefCell::new([None, None]));
                     let recorder = |k: usize| {
                         let states = states.clone();
@@ -431,7 +477,7 @@ mod tests {
                     let playback = connect_playback(
                         &core,
                         Some(sink),
-                        playout_rx,
+                        mixer,
                         shared.clone(),
                         id + 1,
                         recorder(1),
@@ -442,11 +488,12 @@ mod tests {
                         capture,
                         playback,
                         captured,
-                        blocks,
+                        slots: [stream_tx, track_tx],
                         shared,
                         states,
-                        expected_ms: Vec::new(),
+                        expected: Vec::new(),
                         measured_ms: Vec::new(),
+                        last_onset_ns: None,
                     }
                 })
                 .collect();
@@ -462,13 +509,13 @@ mod tests {
             // Safety: every playback link goes to a test sink before anything but silence plays.
             let prefix = format!("beatsync-test-{pid}-");
             let linked = wait_until(Duration::from_secs(3), || {
-                let links = links_from(PLAYBACK_NAME);
+                let links = own_links(PLAYBACK_NAME);
                 links.len() == 4 && links.iter().all(|p| p.starts_with(&prefix))
             });
             assert!(
                 linked,
                 "playback only to test sinks: {:?}",
-                links_from(PLAYBACK_NAME)
+                own_links(PLAYBACK_NAME)
             );
 
             for (i, l) in loops.iter_mut().enumerate() {
@@ -476,7 +523,7 @@ mod tests {
                 let first = l.shared.mono_to_server_ms(mono_ns()) + 300.0 + 7.3 * i as f64;
                 l.schedule(first);
             }
-            let clicks = CLICK_BLOCKS.len();
+            let clicks = 2 * CLICK_BLOCKS.len();
             let all_found = pump(&main_loop, Duration::from_secs(3), || {
                 loops.iter_mut().for_each(Loopback::scan);
                 loops.iter().all(|l| l.measured_ms.len() >= clicks)
@@ -484,16 +531,14 @@ mod tests {
 
             let mut report = Vec::new();
             for l in &loops {
-                let errors: Vec<f64> = l
-                    .measured_ms
-                    .iter()
-                    .zip(&l.expected_ms)
-                    .map(|(m, e)| m - e)
-                    .collect();
+                let errors = [Slot::Stream, Slot::Track].map(|slot| l.errors(slot));
                 let dropped = l.shared.capture_dropped.load(Ordering::Relaxed);
                 println!(
-                    "{}: click errors (measured − scheduled) ms: {errors:.4?}; {}; dropped {dropped}",
+                    "{}: click errors (measured − scheduled) ms: stream slot {:.4?}, track \
+                     slot {:.4?}; {}; dropped {dropped}",
                     l.sink,
+                    errors[0],
+                    errors[1],
                     l.timing()
                 );
                 let quantum = l.capture_quantum();
@@ -514,10 +559,13 @@ mod tests {
                     "{sink}: the forced quantum"
                 );
                 assert_eq!(*found, clicks, "{sink}: one onset per click: {errors:?}");
-                assert!(
-                    errors.iter().all(|e| e.abs() < MAX_ERROR_MS),
-                    "{sink}: timing error below {MAX_ERROR_MS} ms: {errors:?}"
-                );
+                for (slot, errors) in [Slot::Stream, Slot::Track].iter().zip(errors) {
+                    assert_eq!(errors.len(), CLICK_BLOCKS.len(), "{sink} {slot:?}");
+                    assert!(
+                        errors.iter().all(|e| e.abs() < MAX_ERROR_MS),
+                        "{sink} {slot:?}: timing error below {MAX_ERROR_MS} ms: {errors:?}"
+                    );
+                }
             }
             assert!(gone, "test sinks are removed");
         }

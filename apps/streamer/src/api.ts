@@ -36,6 +36,8 @@ export interface Status {
   syncMeasurements: number;
   nudgeMs: number;
   listeners: number;
+  /** The core's shuffle state; it picks the next track at a track's end. */
+  shuffle: boolean;
   phase: Phase;
   message: string | null;
 }
@@ -55,6 +57,9 @@ export const joinRoom = (roomId: string, username: string) => invoke<Settings>("
 
 /** Resolves when the routing is restored and the connection is closed. */
 export const leaveRoom = () => invoke<void>("leave_room");
+
+/** Turns the core's shuffle on or off. The new state arrives in the status. */
+export const setShuffle = (on: boolean) => invoke<void>("set_shuffle", { on });
 
 /** Saves the nudge, applies it at once and returns the saved settings. */
 export const setNudge = (nudgeMs: number) => invoke<Settings>("set_nudge", { nudgeMs });

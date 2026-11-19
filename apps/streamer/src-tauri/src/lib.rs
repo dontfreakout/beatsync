@@ -29,6 +29,7 @@ pub fn run() {
             commands::join_room,
             commands::leave_room,
             commands::set_nudge,
+            commands::set_shuffle,
             commands::send_action,
             commands::upload_audio,
             commands::list_apps,

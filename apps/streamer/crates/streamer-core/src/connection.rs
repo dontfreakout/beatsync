@@ -40,6 +40,8 @@ pub enum Outgoing {
         group_id: u64,
         client_rtt: Option<f64>,
         client_nudge_ms: f64,
+        /// `clientCompensationMs` of both requests ([`client_compensation_ms`]).
+        client_compensation_ms: Option<f64>,
     },
 }
 
@@ -142,25 +144,46 @@ enum SessionEnd {
     Stop,
 }
 
+/// The second request of a probe pair, due at `deadline`.
 struct PendingProbe {
     deadline: Instant,
-    group_id: u64,
-    client_rtt: Option<f64>,
-    client_nudge_ms: f64,
+    probe: Probe,
 }
 
-fn probe_message(
+/// What both requests of a probe pair carry besides the send time.
+#[derive(Clone, Copy)]
+struct Probe {
     group_id: u64,
     client_rtt: Option<f64>,
     client_nudge_ms: f64,
-    index: u8,
-) -> Message {
+    client_compensation_ms: Option<f64>,
+}
+
+/// The local compensation an app reports in its NTP requests: how far ahead its output
+/// renders (the output latency; a value not measured counts as 0) plus its nudge, when that
+/// is above 0, as the web client reports it. The server schedules a `PLAY` or `PAUSE` at
+/// least that far ahead. The CLI reports none: it plays no queue track.
+pub fn client_compensation_ms(kind: JoinKind, render_ahead_ms: f64, nudge_ms: f64) -> Option<f64> {
+    if kind != JoinKind::App {
+        return None;
+    }
+    let output_latency_ms = if render_ahead_ms.is_finite() {
+        render_ahead_ms.max(0.0)
+    } else {
+        0.0
+    };
+    let compensation_ms = output_latency_ms + nudge_ms;
+    // NaN is not above 0 either.
+    (compensation_ms > 0.0).then_some(compensation_ms)
+}
+
+fn probe_message(probe: Probe, index: u8) -> Message {
     let msg = ClientMessage::NtpRequest {
         t0: epoch_ms(),
-        client_rtt,
-        client_compensation_ms: None,
-        client_nudge_ms: Some(client_nudge_ms),
-        probe_group_id: group_id,
+        client_rtt: probe.client_rtt,
+        client_compensation_ms: probe.client_compensation_ms,
+        client_nudge_ms: Some(probe.client_nudge_ms),
+        probe_group_id: probe.group_id,
         probe_group_index: index,
     };
     json_message(&msg)
@@ -241,7 +264,7 @@ async fn session(
             }
             _ = probe_wait => {
                 if let Some(p) = pending.take() {
-                    to_send.push(probe_message(p.group_id, p.client_rtt, p.client_nudge_ms, 1));
+                    to_send.push(probe_message(p.probe, 1));
                 }
             }
             out = out_rx.recv() => match out {
@@ -249,16 +272,25 @@ async fn session(
                 Some(Outgoing::Json(m)) => to_send.push(json_message(&m)),
                 Some(Outgoing::Binary(b)) => to_send.push(Message::binary(b)),
                 Some(Outgoing::Action(action)) => to_send.push(Message::text(action.to_string())),
-                Some(Outgoing::ProbePair { group_id, client_rtt, client_nudge_ms }) => {
+                Some(Outgoing::ProbePair {
+                    group_id,
+                    client_rtt,
+                    client_nudge_ms,
+                    client_compensation_ms,
+                }) => {
                     if let Some(p) = pending.take() {
-                        to_send.push(probe_message(p.group_id, p.client_rtt, p.client_nudge_ms, 1));
+                        to_send.push(probe_message(p.probe, 1));
                     }
-                    to_send.push(probe_message(group_id, client_rtt, client_nudge_ms, 0));
-                    pending = Some(PendingProbe {
-                        deadline: Instant::now() + Duration::from_millis(PROBE_GAP_MS as u64),
+                    let probe = Probe {
                         group_id,
                         client_rtt,
                         client_nudge_ms,
+                        client_compensation_ms,
+                    };
+                    to_send.push(probe_message(probe, 0));
+                    pending = Some(PendingProbe {
+                        deadline: Instant::now() + Duration::from_millis(PROBE_GAP_MS as u64),
+                        probe,
                     });
                 }
             },
@@ -570,22 +602,24 @@ mod tests {
             .unwrap();
     }
 
-    #[tokio::test]
-    async fn probe_pair_is_two_requests_about_25_ms_apart() {
-        let mut h = harness().await;
-        let mut ws = accept(&h.listener).await;
-        assert!(matches!(next_ev(&mut h).await, ConnEvent::Connected));
+    /// The two NTP requests of one probe pair, with the time each arrived.
+    async fn probe_pair(
+        h: &Harness,
+        ws: &mut Ws,
+        client_compensation_ms: Option<f64>,
+    ) -> Vec<(Instant, serde_json::Value)> {
         h.out_tx
             .send(Outgoing::ProbePair {
                 group_id: 7,
                 client_rtt: Some(12.5),
                 client_nudge_ms: 7.5,
+                client_compensation_ms,
             })
             .await
             .unwrap();
         let mut got = Vec::new();
         for _ in 0..2 {
-            let m = next_msg(&mut ws).await;
+            let m = next_msg(ws).await;
             let at = Instant::now();
             let Message::Text(t) = m else {
                 panic!("not text")
@@ -593,6 +627,15 @@ mod tests {
             let v: serde_json::Value = serde_json::from_str(t.as_str()).unwrap();
             got.push((at, v));
         }
+        got
+    }
+
+    #[tokio::test]
+    async fn probe_pair_is_two_requests_about_25_ms_apart() {
+        let mut h = harness().await;
+        let mut ws = accept(&h.listener).await;
+        assert!(matches!(next_ev(&mut h).await, ConnEvent::Connected));
+        let got = probe_pair(&h, &mut ws, None).await;
         assert_eq!(got[0].1["type"], "NTP_REQUEST");
         assert_eq!(got[0].1["probeGroupIndex"], 0);
         assert_eq!(got[1].1["probeGroupIndex"], 1);
@@ -603,9 +646,33 @@ mod tests {
         assert_eq!(got[0].1["clientNudgeMs"], 7.5);
         assert_eq!(got[1].1["clientNudgeMs"], 7.5);
         assert!(got[0].1.get("clientCompensationMs").is_none());
+        assert!(got[1].1.get("clientCompensationMs").is_none());
         let gap = got[1].0.duration_since(got[0].0).as_secs_f64() * 1000.0;
         assert!((20.0..40.0).contains(&gap), "gap {gap} ms");
+
+        // A compensation goes into both requests.
+        let got = probe_pair(&h, &mut ws, Some(52.25)).await;
+        assert_eq!(got[0].1["clientCompensationMs"], 52.25);
+        assert_eq!(got[1].1["clientCompensationMs"], 52.25);
         h.shutdown_tx.send(true).unwrap();
+    }
+
+    #[test]
+    fn only_the_app_reports_a_positive_compensation() {
+        // Like the web client: output latency plus nudge, sent only when above 0. The server
+        // schedules a PLAY far enough ahead for it. The CLI plays no queue track.
+        let app = |ahead, nudge| client_compensation_ms(JoinKind::App, ahead, nudge);
+        assert_eq!(app(42.5, 7.5), Some(50.0));
+        assert_eq!(app(0.0, 3.0), Some(3.0));
+        assert_eq!(app(40.0, -40.0), None);
+        assert_eq!(app(10.0, -50.0), None);
+        // A render-ahead the output has not measured counts as 0.
+        assert_eq!(app(f64::NAN, 5.0), Some(5.0));
+        assert_eq!(app(f64::INFINITY, 5.0), Some(5.0));
+        assert_eq!(app(20.0, f64::NAN), None);
+        let cli = |ahead, nudge| client_compensation_ms(JoinKind::Streamer, ahead, nudge);
+        assert_eq!(cli(42.5, 7.5), None);
+        assert_eq!(cli(0.0, 30.0), None);
     }
 
     #[tokio::test]

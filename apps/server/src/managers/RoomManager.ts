@@ -225,15 +225,19 @@ export class RoomManager {
       return false;
     }
 
-    // Streamer clients never load queue tracks, so only web clients are waited for.
-    // `app` clients are waited for from part 3 (they cannot load tracks yet).
-    const webClients = this.getClients().filter((client) => client.kind === "web");
-    // Don't start playback if there are no web clients
-    if (webClients.length === 0) {
+    // Streamer clients never load queue tracks, so only web and app clients are waited for.
+    const loaders = this.getClients().filter((client) => this.loadsQueueTracks(client.kind));
+    // Don't start playback if no client can load the track
+    if (loaders.length === 0) {
       return false;
     }
 
-    return webClients.every((client) => this.pendingPlay?.clientsLoaded.has(client.clientId));
+    return loaders.every((client) => this.pendingPlay?.clientsLoaded.has(client.clientId));
+  }
+
+  // Web and app clients load queue tracks and acknowledge them. Streamer clients never do.
+  private loadsQueueTracks(kind: ClientKind): boolean {
+    return kind === "web" || kind === "app";
   }
 
   /**

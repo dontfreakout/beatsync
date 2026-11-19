@@ -39,6 +39,30 @@ export function isSelectedPlaying(
   return selected !== null && playback?.audioSource === selected && isPlaying(playback, serverNow, durationS);
 }
 
+/** What the server set for the playback; it stays the same while the position runs on. */
+export function playbackKey(playback: PlaybackState | null): string {
+  if (!playback) return "none";
+  return `${playback.kind}|${playback.audioSource ?? ""}|${playback.serverTimeToExecute}|${playback.trackTimeSeconds ?? ""}`;
+}
+
+/**
+ * Sends a seek and holds its position on the seek bar (see `heldSeekPosition`). A seek that is
+ * not sent (for example, the socket is closed) releases its hold, unless a newer one replaced it.
+ */
+export async function sendHeldSeek<H>(
+  hold: H,
+  setHeld: (update: (current: H | null) => H | null) => void,
+  send: () => Promise<boolean>
+): Promise<void> {
+  setHeld(() => hold);
+  if (!(await send())) setHeld((current) => (current === hold ? null : current));
+}
+
+/** A committed seek position stays on screen until the server sets another playback. */
+export function heldSeekPosition(held: { position: number; key: string } | null, key: string): number | null {
+  return held !== null && held.key === key ? held.position : null;
+}
+
 /** Web `skipToNextTrack`: null for one track or no current track; shuffle never repeats. */
 export function nextTrack(urls: string[], current: string | null, shuffled: boolean, rand = Math.random): string | null {
   if (urls.length <= 1 || current === null) return null;

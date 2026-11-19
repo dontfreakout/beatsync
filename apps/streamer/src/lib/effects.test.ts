@@ -103,6 +103,17 @@ describe("nextHold", () => {
   });
 });
 
+describe("held volume", () => {
+  const same = (a: number, b: number) => a === b;
+
+  it("keeps_the_committed_volume_until_the_server_sends_another", () => {
+    const held = { value: 0.8, base: 0.3 };
+    expect(resolveHeld(held, 0.3, same)).toBe(0.8);
+    expect(resolveHeld(held, 0.5, same)).toBe(0.5);
+    expect(nextHold(held, 0.5, same)).toBeNull();
+  });
+});
+
 describe("listening source drag", () => {
   it("starts_no_drag_while_spatial_audio_is_off_or_the_user_cannot_mutate", () => {
     expect(canStartDrag(true, true)).toBe(true);

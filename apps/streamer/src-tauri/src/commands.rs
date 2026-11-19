@@ -274,6 +274,17 @@ pub async fn set_nudge(state: State<'_, AppState>, nudge_ms: f64) -> CommandResu
     Ok(session.settings.clone())
 }
 
+/// Turns the core's shuffle on or off. The state shows in the status.
+#[tauri::command]
+pub async fn set_shuffle(state: State<'_, AppState>, on: bool) -> CommandResult<()> {
+    let session = state.session.lock().await;
+    let Some(handle) = &session.handle else {
+        return Err("Not in a room".to_string());
+    };
+    handle.set_shuffle(on);
+    Ok(())
+}
+
 /// Sends a room action of the window (chat, admin, permissions, another user's stream stop).
 /// Refused while disconnected and for the types the core sends itself.
 #[tauri::command]
@@ -453,8 +464,8 @@ fn log_line(s: &Status) -> String {
         Phase::Streaming { stream_id } => format!("streaming({stream_id})"),
     };
     let mut line = format!(
-        "connected={} synced={} listeners={} phase={phase}",
-        s.connected, s.synced, s.listeners
+        "connected={} synced={} listeners={} shuffle={} phase={phase}",
+        s.connected, s.synced, s.listeners, s.shuffle
     );
     if let Some(message) = &s.message {
         line.push_str(&format!(" message=\"{message}\""));
@@ -472,6 +483,7 @@ fn idle_status(nudge_ms: f64) -> Status {
         offset_ms: None,
         sync_measurements: 0,
         nudge_ms,
+        shuffle: false,
         listeners: 0,
         phase: Phase::Idle,
         message: None,
@@ -567,6 +579,16 @@ mod tests {
     use tauri::ipc::InvokeResponseBody;
 
     use super::*;
+
+    #[test]
+    fn the_idle_status_has_shuffle_off() {
+        let status = idle_status(0.0);
+        assert!(!status.shuffle);
+        assert_eq!(
+            serde_json::to_value(&status).unwrap()["shuffle"],
+            json!(false)
+        );
+    }
 
     /// The window end of hub channels: records what they get as JSON; every send fails while
     /// `failing` is set.

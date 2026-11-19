@@ -38,6 +38,17 @@ pub enum ClientMessage {
     /// Asks for the room's playback state; while a track plays, the server answers this
     /// client with a scheduled PLAY.
     Sync,
+    /// Answers a `LOAD_AUDIO_SOURCE`: this client is done loading the track (or failed). The
+    /// server starts a play once every client that loads queue tracks answered, or after 3 s.
+    AudioSourceLoaded {
+        source: AudioSource,
+    },
+}
+
+/// A queue track, as the server names it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AudioSource {
+    pub url: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -105,6 +116,13 @@ pub enum ScheduledAction {
         gains: HashMap<String, SpatialGain>,
     },
     StopSpatialAudio,
+    LowPassConfig {
+        freq: f64,
+        ramp_time: f64,
+    },
+    MetronomeConfig {
+        enabled: bool,
+    },
     #[serde(other)]
     Other,
 }

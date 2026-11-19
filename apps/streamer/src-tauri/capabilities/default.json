@@ -11,6 +11,7 @@
     "allow-join-room",
     "allow-leave-room",
     "allow-set-nudge",
+    "allow-set-shuffle",
     "allow-send-action",
     "allow-upload-audio",
     "allow-list-apps",

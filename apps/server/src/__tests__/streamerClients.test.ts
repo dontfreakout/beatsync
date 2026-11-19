@@ -105,17 +105,30 @@ describe("Streamer clients", () => {
     expect(isAdmin(room, "S")).toBe(false);
   });
 
-  it("PLAY does not wait for an app client to load the track (until part 3)", () => {
+  it("PLAY waits for an app client to load the track", () => {
     join(room, "A");
     join(room, "B");
     join(room, "P", "app");
 
     const play: PlayActionType = { type: "PLAY", audioSource: AUDIO_URL, trackTimeSeconds: 0 };
     room.initiateAudioSourceLoad(play, "A", server);
+    room.processClientLoadedAudioSource("A", server);
     room.processClientLoadedAudioSource("B", server);
+    expect(broadcastMessages.filter((m) => m.message.type === "SCHEDULED_ACTION")).toHaveLength(0);
 
-    const scheduled = broadcastMessages.filter((m) => m.message.type === "SCHEDULED_ACTION");
-    expect(scheduled).toHaveLength(1);
+    room.processClientLoadedAudioSource("P", server);
+    expect(broadcastMessages.filter((m) => m.message.type === "SCHEDULED_ACTION")).toHaveLength(1);
+  });
+
+  it("PLAY with only an app client waits for its ack", () => {
+    join(room, "P", "app");
+
+    const play: PlayActionType = { type: "PLAY", audioSource: AUDIO_URL, trackTimeSeconds: 0 };
+    room.initiateAudioSourceLoad(play, "P", server);
+    expect(broadcastMessages.filter((m) => m.message.type === "SCHEDULED_ACTION")).toHaveLength(0);
+
+    room.processClientLoadedAudioSource("P", server);
+    expect(broadcastMessages.filter((m) => m.message.type === "SCHEDULED_ACTION")).toHaveLength(1);
   });
 
   it("an app client that joins where only a streamer is admin becomes admin", () => {

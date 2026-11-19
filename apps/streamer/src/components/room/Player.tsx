@@ -1,15 +1,19 @@
 import { Pause, Play, Repeat, Shuffle, SkipBack, SkipForward } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
+import { setShuffle } from "@/api";
 import { Slider } from "@/components/ui/slider";
 import { sendRoomAction } from "@/lib/actions";
 import {
   formatTime,
+  heldSeekPosition,
   isSelectedPlaying,
   nextTrack,
+  playbackKey,
   previousTrack,
   seekAction,
   selectedPosition,
+  sendHeldSeek,
   serverNowMs,
   skipAction,
 } from "@/lib/player";
@@ -55,8 +59,8 @@ export function Player() {
   const audioSources = useRoomStore((s) => s.audioSources);
   const clientId = useSessionStore((s) => s.settings.clientId);
   const canControl = useRoomStore((s) => canControlIn(s, clientId));
-  const shuffled = usePlayerStore((s) => s.shuffled);
-  const toggleShuffle = usePlayerStore((s) => s.toggleShuffle);
+  const shuffled = useSessionStore((s) => s.status.shuffle);
+  const playbackKeyNow = useRoomStore((s) => playbackKey(s.playback));
   const playbackKind = useRoomStore((s) => s.playback?.kind);
   // Subscribe, so that the render below reads fresh values.
   useRoomStore((s) => s.currentAudioSource);
@@ -82,6 +86,10 @@ export function Player() {
   // A drag shows its own value. `pendingSeek` also covers a commit that Radix swallows (web).
   const [dragPosition, setDragPosition] = useState<number | null>(null);
   const pendingSeek = useRef<number | null>(null);
+  // After a commit the seek bar keeps the committed position until the server sets a new playback
+  // (or the seek was not sent).
+  const [heldSeek, setHeldSeek] = useState<{ position: number; key: string } | null>(null);
+  if (heldSeek !== null && heldSeek.key !== playbackKeyNow) setHeldSeek(null);
   const commitSeek = () => {
     const value = pendingSeek.current;
     if (value === null) return;
@@ -90,8 +98,10 @@ export function Player() {
     const now = readPlayer();
     if (!now.canControl || now.selected === null) return;
     const action = seekAction(now.selected, now.playing, value);
-    if (action) void sendRoomAction(action);
-    else usePlayerStore.getState().setPausedPosition(value);
+    if (action) {
+      const hold = { position: value, key: playbackKey(now.room.playback) };
+      void sendHeldSeek(hold, setHeldSeek, () => sendRoomAction(action));
+    } else usePlayerStore.getState().setPausedPosition(value);
   };
 
   // Space toggles play/pause, except while typing. The listener exists only while the player does.
@@ -110,14 +120,14 @@ export function Player() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, []);
 
-  const shown = dragPosition ?? position;
+  const shown = dragPosition ?? heldSeekPosition(heldSeek, playbackKeyNow) ?? position;
   const side = "cursor-pointer text-gray-400 transition-colors duration-200 hover:scale-105 hover:text-white disabled:cursor-not-allowed disabled:opacity-50";
 
   return (
     <div className="flex w-full justify-center">
       <div className="w-full max-w-[37rem]">
         <div className="mb-2 flex items-center justify-center gap-6">
-          <button className={side} onClick={toggleShuffle} disabled={!manyTracks || !canControl}>
+          <button className={side} onClick={() => void setShuffle(!shuffled)} disabled={!manyTracks || !canControl}>
             <div className="relative">
               <Shuffle className={cn("relative size-4", shuffled ? "text-primary-400" : "text-current")} />
               {shuffled && (

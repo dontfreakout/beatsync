@@ -31,7 +31,11 @@
     },
     { "name": "updateLiveStream", "message": { "type": "UPDATE_LIVE_STREAM", "label": "Firefox" } },
     { "name": "stopLiveStream", "message": { "type": "STOP_LIVE_STREAM" } },
-    { "name": "sync", "message": { "type": "SYNC" } }
+    { "name": "sync", "message": { "type": "SYNC" } },
+    {
+      "name": "audioSourceLoaded",
+      "message": { "type": "AUDIO_SOURCE_LOADED", "source": { "url": "https://r2.example/room-123456/song.mp3" } }
+    }
   ],
   "serverToClient": [
     {
@@ -219,6 +223,24 @@
           "isFullSync": false,
           "newestId": 1
         }
+      }
+    },
+    {
+      "name": "lowPassConfig",
+      "known": true,
+      "message": {
+        "type": "SCHEDULED_ACTION",
+        "serverTimeToExecute": 1700000010300,
+        "scheduledAction": { "type": "LOW_PASS_CONFIG", "freq": 800, "rampTime": 0.2 }
+      }
+    },
+    {
+      "name": "metronomeConfig",
+      "known": true,
+      "message": {
+        "type": "SCHEDULED_ACTION",
+        "serverTimeToExecute": 1700000010400,
+        "scheduledAction": { "type": "METRONOME_CONFIG", "enabled": true }
       }
     },
     {

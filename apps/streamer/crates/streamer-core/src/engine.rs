@@ -61,7 +61,15 @@ pub enum Input {
     UserNudge {
         nudge_ms: f64,
     },
+    /// The user turned shuffle on or off.
+    UserShuffle {
+        on: bool,
+    },
     AudioFailed {
+        message: String,
+    },
+    /// The audio output failed and stays closed for this connection. A stream goes on.
+    OutputFailed {
         message: String,
     },
     /// One 20 ms Opus packet from the audio worker.
@@ -102,6 +110,19 @@ pub enum Output {
         gain: f32,
         ramp_s: f32,
     },
+    /// The low-pass filter goes to `freq_hz` over `ramp_s` (app only).
+    SetLowPass {
+        freq_hz: f32,
+        ramp_s: f32,
+    },
+    /// The metronome plays or not: the room enabled it and the clock is synced (app only).
+    SetMetronome {
+        on: bool,
+    },
+    /// The shuffle state changed.
+    SetShuffle {
+        on: bool,
+    },
     Status(Status),
 }
 
@@ -120,6 +141,8 @@ pub struct Status {
     /// Accepted NTP measurements, 0..=16.
     pub sync_measurements: usize,
     pub nudge_ms: f64,
+    /// Shuffle is on; false on a new engine.
+    pub shuffle: bool,
     pub listeners: usize,
     pub phase: Phase,
     pub message: Option<String>,
@@ -168,6 +191,9 @@ pub struct Engine {
     message: Option<String>,
     /// The message of the last failed connect attempt; a connect clears it from `message`.
     connect_error: Option<String>,
+    /// "Audio output failed: …": the output stays closed for the rest of the connection, so
+    /// the status shows it whenever no other message does.
+    output_failure: Option<String>,
     volume: f64,
     spatial_gain: f64,
     last_status: Option<Status>,
@@ -182,6 +208,13 @@ pub struct Engine {
     is_app: bool,
     /// SYNC was sent on the current connection.
     room_sync_sent: bool,
+    /// The last low-pass frequency sent out; the first one after a join is always sent.
+    last_lowpass_hz: Option<f64>,
+    /// The room has the metronome on.
+    metronome_enabled: bool,
+    /// The last metronome state sent out.
+    metronome_on: bool,
+    shuffle: bool,
 }
 
 impl Engine {
@@ -207,6 +240,7 @@ impl Engine {
             clients: Vec::new(),
             message: None,
             connect_error: None,
+            output_failure: None,
             volume: 1.0,
             spatial_gain: 1.0,
             last_status: None,
@@ -214,6 +248,10 @@ impl Engine {
             nudge_restored: false,
             is_app,
             room_sync_sent: false,
+            last_lowpass_hz: None,
+            metronome_enabled: false,
+            metronome_on: false,
+            shuffle: false,
         }
     }
 
@@ -279,9 +317,20 @@ impl Engine {
                 self.nudge_ms = nudge_ms;
                 self.nudge_restored = true;
             }
+            Input::UserShuffle { on } => {
+                if self.shuffle != on {
+                    self.shuffle = on;
+                    out.push(Output::SetShuffle { on });
+                }
+            }
             Input::AudioFailed { message } => {
                 self.stop(&mut out);
                 self.message = Some(message);
+            }
+            Input::OutputFailed { message } => {
+                let failure = format!("Audio output failed: {message}");
+                self.message = Some(failure.clone());
+                self.output_failure = Some(failure);
             }
             Input::EncodedBlock {
                 capture_server_ms,
@@ -299,6 +348,7 @@ impl Engine {
             }
         }
         self.send_start_when_ready(&mut out);
+        self.update_metronome(&mut out);
         self.emit_status(&mut out);
         out
     }
@@ -518,10 +568,34 @@ impl Engine {
                 self.spatial_gain = 1.0;
                 STOP_SPATIAL_RAMP_S
             }
+            ScheduledAction::LowPassConfig { freq, ramp_time } => {
+                // Only the app filters. A new ramp time alone does not move the filter.
+                if self.is_app && self.last_lowpass_hz != Some(freq) {
+                    self.last_lowpass_hz = Some(freq);
+                    out.push(Output::SetLowPass {
+                        freq_hz: freq as f32,
+                        ramp_s: ramp_time as f32,
+                    });
+                }
+                return;
+            }
+            ScheduledAction::MetronomeConfig { enabled } => {
+                self.metronome_enabled = enabled;
+                return;
+            }
             ScheduledAction::Other => return,
         };
         let gain = (self.volume * self.spatial_gain) as f32;
         out.push(Output::SetPlayoutGain { gain, ramp_s });
+    }
+
+    /// The metronome plays in the app only, while the room has it on and the clock is synced.
+    fn update_metronome(&mut self, out: &mut Vec<Output>) {
+        let on = self.is_app && self.metronome_enabled && self.estimator.is_synced();
+        if on != self.metronome_on {
+            self.metronome_on = on;
+            out.push(Output::SetMetronome { on });
+        }
     }
 
     fn stop(&mut self, out: &mut Vec<Output>) {
@@ -575,13 +649,14 @@ impl Engine {
             offset_ms: self.last_offset_ms,
             sync_measurements: self.estimator.measurements(),
             nudge_ms: self.nudge_ms,
+            shuffle: self.shuffle,
             listeners: self
                 .clients
                 .iter()
                 .filter(|c| c.client_id != self.client_id)
                 .count(),
             phase: self.phase,
-            message: self.message.clone(),
+            message: self.message.clone().or_else(|| self.output_failure.clone()),
         };
         if self.last_status.as_ref() != Some(&status) {
             self.last_status = Some(status.clone());
@@ -1328,6 +1403,48 @@ mod tests {
     }
 
     #[test]
+    fn output_failure_shows_in_the_status() {
+        // The PC's speakers are gone, but the room still hears the stream: it goes on, and
+        // the status says why the PC is silent.
+        let mut h = Harness::streaming(3);
+        let out = h.feed(Input::OutputFailed {
+            message: "device gone".into(),
+        });
+        assert!(without_status(out).is_empty(), "no stop");
+        assert_eq!(h.phase(), Phase::Streaming { stream_id: 3 });
+        assert_eq!(h.message(), Some("Audio output failed: device gone"));
+    }
+
+    #[test]
+    fn the_output_failure_stays_in_the_status_while_the_output_is_closed() {
+        // The output stays closed for the rest of the connection, so every later stream and
+        // track is silent on this PC: the status must go on saying why.
+        let failure = Some("Audio output failed: device gone");
+        let mut h = Harness::connected();
+        h.sync();
+        h.feed(Input::OutputFailed {
+            message: "device gone".into(),
+        });
+        h.feed(user_start(&["Spotify"]));
+        assert_eq!(h.message(), failure, "a new start keeps it");
+
+        // A newer message shows first; the failure is back when that one clears.
+        h.server(ServerMessage::LiveStreamRejected {
+            reason: RejectReason::AlreadyActive,
+        });
+        assert_eq!(h.message(), Some("Another stream is active"));
+        h.feed(user_start(&["Spotify"]));
+        assert_eq!(h.message(), failure);
+
+        // A reconnect does not reopen the output.
+        h.feed(Input::ConnectFailed {
+            error: "refused".into(),
+        });
+        h.feed(Input::Connected);
+        assert_eq!(h.message(), failure);
+    }
+
+    #[test]
     fn updated_apps_reach_audio_and_label() {
         let mut h = Harness::connected();
         // Idle: the selection is only stored.
@@ -1377,6 +1494,7 @@ mod tests {
             offset_ms: None,
             sync_measurements: 0,
             nudge_ms: 0.0,
+            shuffle: false,
             listeners: 0,
             phase: Phase::Idle,
             message: None,
@@ -1391,6 +1509,94 @@ mod tests {
         assert_eq!(h.status().listeners, 2);
         // Unchanged status: no new Status.
         assert!(statuses(&h.server(client_change(&clients))).is_empty());
+    }
+
+    fn low_pass(freq: f64, ramp_time: f64) -> ServerMessage {
+        scheduled(ScheduledAction::LowPassConfig { freq, ramp_time })
+    }
+
+    fn metronome(enabled: bool) -> ServerMessage {
+        scheduled(ScheduledAction::MetronomeConfig { enabled })
+    }
+
+    fn metronome_outputs(out: &[Output]) -> Vec<bool> {
+        out.iter()
+            .filter_map(|o| match o {
+                Output::SetMetronome { on } => Some(*on),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn low_pass_config_reaches_the_output() {
+        let mut h = Harness::app();
+        h.feed(Input::Connected);
+        let out = h.server(low_pass(800.0, 0.2));
+        assert_eq!(
+            without_status(out),
+            vec![Output::SetLowPass {
+                freq_hz: 800.0,
+                ramp_s: 0.2
+            }]
+        );
+    }
+
+    #[test]
+    fn an_unchanged_low_pass_frequency_is_ignored() {
+        let mut h = Harness::app();
+        h.feed(Input::Connected);
+        assert_eq!(without_status(h.server(low_pass(800.0, 0.2))).len(), 1);
+        // The same frequency with another ramp time does nothing.
+        assert!(without_status(h.server(low_pass(800.0, 0.5))).is_empty());
+        assert_eq!(without_status(h.server(low_pass(900.0, 0.5))).len(), 1);
+        // The first one after a new join is sent again.
+        let mut fresh = Harness::app();
+        fresh.feed(Input::Connected);
+        assert_eq!(without_status(fresh.server(low_pass(900.0, 0.5))).len(), 1);
+    }
+
+    #[test]
+    fn the_metronome_plays_only_when_enabled_and_synced() {
+        let mut h = Harness::app();
+        h.feed(Input::Connected);
+        // Enabled, but the clock is not synced: nothing yet.
+        assert!(metronome_outputs(&h.server(metronome(true))).is_empty());
+        assert_eq!(metronome_outputs(&h.sync()), vec![true]);
+        assert!(metronome_outputs(&h.server(metronome(true))).is_empty());
+        assert_eq!(metronome_outputs(&h.server(metronome(false))), vec![false]);
+        assert_eq!(metronome_outputs(&h.server(metronome(true))), vec![true]);
+        // The clock step ends the sync: the metronome stops.
+        let out = h.feed(Input::ClockStepped { delta_ms: 1000.0 });
+        assert_eq!(metronome_outputs(&out), vec![false]);
+    }
+
+    #[test]
+    fn the_cli_ignores_low_pass_and_metronome() {
+        let mut h = Harness::new();
+        h.feed(Input::Connected);
+        let mut all = h.server(low_pass(800.0, 0.2));
+        all.extend(h.server(metronome(true)));
+        all.extend(h.sync());
+        assert!(
+            without_status(all)
+                .iter()
+                .all(|o| !matches!(o, Output::SetLowPass { .. } | Output::SetMetronome { .. }))
+        );
+    }
+
+    #[test]
+    fn shuffle_shows_in_the_status() {
+        let mut h = Harness::app();
+        h.feed(Input::Connected);
+        assert!(!h.status().shuffle);
+        let out = h.feed(Input::UserShuffle { on: true });
+        assert!(out.contains(&Output::SetShuffle { on: true }));
+        assert!(h.status().shuffle);
+        let out = h.feed(Input::UserShuffle { on: true });
+        assert!(!out.contains(&Output::SetShuffle { on: true }));
+        h.feed(Input::UserShuffle { on: false });
+        assert!(!h.status().shuffle);
     }
 
     #[test]

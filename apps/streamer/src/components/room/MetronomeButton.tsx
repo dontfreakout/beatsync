@@ -5,7 +5,7 @@ import { cn } from "@/lib/utils";
 import { canMutate as canMutateIn, useRoomStore } from "@/store/room";
 import { useSessionStore } from "@/store/session";
 
-/** Port of the web `MetronomeButton`, shown once the clock has synced. The app plays no click yet (part 3). */
+/** Port of the web `MetronomeButton`, shown once the clock has synced. */
 export function MetronomeButton() {
   const synced = useSessionStore((s) => s.status.syncedOnce);
   const clientId = useSessionStore((s) => s.settings.clientId);

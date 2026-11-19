@@ -24,6 +24,16 @@ pub trait BlockSource {
     fn pop(&mut self);
 }
 
+impl BlockSource for rtrb::Consumer<PcmBlock> {
+    fn peek(&mut self) -> Option<&PcmBlock> {
+        rtrb::Consumer::peek(self).ok()
+    }
+
+    fn pop(&mut self) {
+        let _ = rtrb::Consumer::pop(self);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PlayoutConfig {
     pub sample_rate: f64,

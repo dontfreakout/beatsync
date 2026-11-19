@@ -2,6 +2,7 @@ import { motion } from "motion/react";
 import { useEffect, useRef } from "react";
 import { toast } from "sonner";
 
+import { BeatFlash } from "@/components/room/BeatFlash";
 import { Bottom } from "@/components/room/Bottom";
 import { Left } from "@/components/room/Left";
 import { InlineSearch } from "@/components/room/InlineSearch";
@@ -29,11 +30,12 @@ function useStatusMessageToast() {
   }, [message]);
 }
 
-/** The three-column layout of the web dashboard's desktop branch; the search sits above the queue as in the web `Main`; Spatial in the right column is part 2. */
+/** The three-column layout of the web dashboard's desktop branch; the search sits above the queue as in the web `Main`; */
 export function RoomScreen() {
   useStatusMessageToast();
   return (
     <div className="flex h-screen w-full flex-col bg-neutral-950 text-white">
+      <BeatFlash />
       <TopBar />
       <motion.div
         className="flex min-h-0 flex-1 flex-col overflow-hidden"

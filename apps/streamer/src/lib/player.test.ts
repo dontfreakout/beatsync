@@ -10,7 +10,10 @@ import {
   previousTrack,
   seekAction,
   isSelectedPlaying,
+  heldSeekPosition,
+  playbackKey,
   selectedPosition,
+  sendHeldSeek,
   serverNowMs,
   skipAction,
   trackPosition,
@@ -155,5 +158,67 @@ describe("isSelectedPlaying", () => {
     expect(isSelectedPlaying(play("a"), "b", now, 100)).toBe(false);
     expect(isSelectedPlaying(play("a"), null, now, 100)).toBe(false);
     expect(isSelectedPlaying(null, "a", now, 100)).toBe(false);
+  });
+});
+
+describe("held seek", () => {
+  const play = (serverTimeToExecute: number, trackTimeSeconds: number): PlaybackState => ({
+    kind: "PLAY",
+    audioSource: "a",
+    serverTimeToExecute,
+    trackTimeSeconds,
+  });
+
+  it("keys_a_playback_by_what_the_server_sets_not_by_the_running_position", () => {
+    expect(playbackKey(play(1000, 5))).toBe(playbackKey(play(1000, 5)));
+    expect(playbackKey(play(1000, 5))).not.toBe(playbackKey(play(2000, 60)));
+    expect(playbackKey(null)).toBe("none");
+  });
+
+  it("keeps_the_committed_position_until_the_playback_changes", () => {
+    const held = { position: 60, key: playbackKey(play(1000, 5)) };
+    expect(heldSeekPosition(held, playbackKey(play(1000, 5)))).toBe(60);
+    expect(heldSeekPosition(held, playbackKey(play(2000, 60)))).toBeNull();
+    expect(heldSeekPosition(null, "none")).toBeNull();
+  });
+
+  type Hold = { position: number; key: string };
+  /** A state like `useState`'s, for the hold. */
+  const holdState = () => {
+    const state = { held: null as Hold | null };
+    const setHeld = (update: (current: Hold | null) => Hold | null) => {
+      state.held = update(state.held);
+    };
+    return { state, setHeld };
+  };
+
+  it("holds_a_sent_seek", async () => {
+    const { state, setHeld } = holdState();
+    const hold = { position: 60, key: "k" };
+    await sendHeldSeek(hold, setHeld, () => Promise.resolve(true));
+    expect(state.held).toBe(hold);
+  });
+
+  it("releases_the_hold_of_a_seek_that_is_not_sent", async () => {
+    // A closed socket: the seek bar must follow the playback again, not freeze.
+    const { state, setHeld } = holdState();
+    let sent: (sent: boolean) => void = () => {};
+    const hold = { position: 60, key: "k" };
+    const done = sendHeldSeek(hold, setHeld, () => new Promise((resolve) => (sent = resolve)));
+    expect(state.held).toBe(hold);
+    sent(false);
+    await done;
+    expect(state.held).toBeNull();
+  });
+
+  it("keeps_a_newer_hold_when_an_older_seek_is_not_sent", async () => {
+    const { state, setHeld } = holdState();
+    let sent: (sent: boolean) => void = () => {};
+    const older = sendHeldSeek({ position: 60, key: "k" }, setHeld, () => new Promise((resolve) => (sent = resolve)));
+    const newer = { position: 90, key: "k" };
+    await sendHeldSeek(newer, setHeld, () => Promise.resolve(true));
+    sent(false);
+    await older;
+    expect(state.held).toBe(newer);
   });
 });

@@ -1,28 +1,24 @@
-// Local player state of the window: shuffle, a selection made while paused, a seek while paused.
+// Local player state of the window: a selection made while paused, a seek while paused.
 import { create } from "zustand";
 
 import { type RoomState, useRoomStore } from "@/store/room";
 
 interface PlayerStore {
-  shuffled: boolean;
   /** A skip while paused changes only this. Clear it whenever `room.currentAudioSource` changes. */
   localSelection: string | null;
   /** A seek while paused, in seconds. */
   pausedPosition: number | null;
-  toggleShuffle: () => void;
   setLocalSelection: (url: string | null) => void;
   setPausedPosition: (seconds: number | null) => void;
   reset: () => void;
 }
 
 export const usePlayerStore = create<PlayerStore>()((set) => ({
-  shuffled: false,
   localSelection: null,
   pausedPosition: null,
-  toggleShuffle: () => set((s) => ({ shuffled: !s.shuffled })),
   setLocalSelection: (localSelection) => set({ localSelection, pausedPosition: null }),
   setPausedPosition: (pausedPosition) => set({ pausedPosition }),
-  reset: () => set({ shuffled: false, localSelection: null, pausedPosition: null }),
+  reset: () => set({ localSelection: null, pausedPosition: null }),
 }));
 
 /**

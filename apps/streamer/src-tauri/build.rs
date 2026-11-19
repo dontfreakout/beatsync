@@ -6,6 +6,7 @@ const COMMANDS: &[&str] = &[
     "join_room",
     "leave_room",
     "set_nudge",
+    "set_shuffle",
     "send_action",
     "upload_audio",
     "list_apps",

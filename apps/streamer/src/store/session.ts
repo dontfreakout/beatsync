@@ -12,6 +12,7 @@ export const INITIAL_STATUS: Status = {
   syncMeasurements: 0,
   nudgeMs: 0,
   listeners: 0,
+  shuffle: false,
   phase: "idle",
   message: null,
 };
