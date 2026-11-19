@@ -21,6 +21,8 @@ const EXIT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub fn run() {
     let app = tauri::Builder::default()
+        // The window's file picker (`open` only; the paths come back to `upload_audio`).
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             commands::get_session,
             commands::save_settings,
@@ -28,11 +30,13 @@ pub fn run() {
             commands::leave_room,
             commands::set_nudge,
             commands::send_action,
+            commands::upload_audio,
             commands::list_apps,
             commands::start_stream,
             commands::update_apps,
             commands::stop_stream,
             commands::subscribe_status,
+            commands::subscribe_tracks,
             commands::subscribe_room,
         ])
         .setup(|app| {

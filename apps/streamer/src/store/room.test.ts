@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 
-import { applyServerMessage, canMutate, initialRoomState, isAdmin, type RoomState } from "./room";
+import { applyServerMessage, canControl, canMutate, initialRoomState, isAdmin, type RoomState } from "./room";
 
 const client = (clientId: string, isAdmin = false) => ({
   username: clientId,
@@ -186,5 +186,94 @@ describe("permissions", () => {
     expect(canMutate(everyone, "guest")).toBe(true);
     expect(isAdmin(adminOnly, "admin")).toBe(true);
     expect(isAdmin(everyone, "guest")).toBe(false);
+  });
+});
+
+const scheduled = (scheduledAction: Record<string, unknown>) => ({
+  type: "SCHEDULED_ACTION",
+  serverTimeToExecute: 5000,
+  scheduledAction,
+});
+
+describe("effects and spatial audio", () => {
+  it("effects_and_spatial_configs_update_the_room", () => {
+    expect(initialRoomState.globalVolume).toBe(1);
+    expect(initialRoomState.lowPassFreq).toBe(20000);
+    expect(initialRoomState.metronome).toBe(false);
+    expect(initialRoomState.spatial).toEqual({ enabled: false, gains: {}, listeningSource: { x: 50, y: 50 } });
+    expect(initialRoomState.streamJobs).toBe(0);
+
+    const state = apply(
+      initialRoomState,
+      scheduled({ type: "GLOBAL_VOLUME_CONFIG", volume: 0.4, rampTime: 0.1 }),
+      scheduled({ type: "LOW_PASS_CONFIG", freq: 800, rampTime: 0.1 }),
+      scheduled({ type: "METRONOME_CONFIG", enabled: true })
+    );
+    expect(state.globalVolume).toBe(0.4);
+    expect(state.lowPassFreq).toBe(800);
+    expect(state.metronome).toBe(true);
+
+    const spatial = apply(
+      state,
+      scheduled({
+        type: "SPATIAL_CONFIG",
+        gains: { a: { gain: 0.8, rampTime: 0.1 } },
+        listeningSource: { x: 10, y: 20 },
+      })
+    );
+    expect(spatial.spatial).toEqual({ enabled: true, gains: { a: 0.8 }, listeningSource: { x: 10, y: 20 } });
+    const stopped = apply(spatial, scheduled({ type: "STOP_SPATIAL_AUDIO" }));
+    expect(stopped.spatial.enabled).toBe(false);
+    expect(stopped.spatial.gains).toEqual({});
+    expect(stopped.spatial.listeningSource).toEqual({ x: 10, y: 20 });
+  });
+
+  it("load_audio_source_selects_the_track", () => {
+    const state = apply(initialRoomState, roomEvent({ type: "LOAD_AUDIO_SOURCE", audioSourceToPlay: { url: "u9" } }));
+    expect(state.currentAudioSource).toBe("u9");
+  });
+
+  it("stream_job_count_follows_the_server", () => {
+    const busy = apply(initialRoomState, { type: "STREAM_JOB_UPDATE", activeJobCount: 2 });
+    expect(busy.streamJobs).toBe(2);
+    expect(apply(busy, { type: "STREAM_JOB_UPDATE", activeJobCount: 0 }).streamJobs).toBe(0);
+  });
+});
+
+describe("playback and the queue", () => {
+  it("position_is_kept_after_a_reorder", () => {
+    const playing = apply(
+      initialRoomState,
+      roomEvent({ type: "SET_AUDIO_SOURCES", sources: [{ url: "u1" }, { url: "u2" }], currentAudioSource: "u2" }),
+      scheduled({ type: "PLAY", audioSource: "u2", trackTimeSeconds: 12 })
+    );
+    const reordered = apply(playing, roomEvent({ type: "SET_AUDIO_SOURCES", sources: [{ url: "u2" }, { url: "u1" }] }));
+    expect(reordered.currentAudioSource).toBe("u2");
+    expect(reordered.playback).toEqual(playing.playback);
+  });
+
+  it("deleting_the_current_track_clears_the_playback", () => {
+    const playing = apply(
+      initialRoomState,
+      roomEvent({ type: "SET_AUDIO_SOURCES", sources: [{ url: "u1" }, { url: "u2" }], currentAudioSource: "u2" }),
+      scheduled({ type: "PLAY", audioSource: "u2", trackTimeSeconds: 12 })
+    );
+    const deleted = apply(playing, roomEvent({ type: "SET_AUDIO_SOURCES", sources: [{ url: "u1" }] }));
+    expect(deleted.currentAudioSource).toBeNull();
+    expect(deleted.playback).toBeNull();
+  });
+});
+
+describe("canControl", () => {
+  it("controls_follow_can_mutate", () => {
+    const clients = [client("admin", true), client("guest")];
+    const adminOnly: RoomState = { ...initialRoomState, clients, permissions: "ADMIN_ONLY" };
+    const everyone: RoomState = { ...adminOnly, permissions: "EVERYONE" };
+    expect(canControl(adminOnly, "admin")).toBe(true);
+    expect(canControl(adminOnly, "guest")).toBe(false);
+    expect(canControl(everyone, "guest")).toBe(true);
+    const live: RoomState = { ...everyone, liveStream: stream as never };
+    expect(canControl(live, "admin")).toBe(false);
+    expect(canControl(live, "guest")).toBe(false);
   });
 });

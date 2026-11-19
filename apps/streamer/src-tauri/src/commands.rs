@@ -2,11 +2,13 @@
 //!
 //! The state owns the settings, the audio backend and the connection ([`StreamerHandle`]).
 //! Nothing connects at launch: [`join_room`] connects, [`leave_room`] stops the stream
-//! (routing restored) and disconnects. Statuses and room messages reach the window through
-//! [`StatusHub`] and [`RoomHub`], which outlive the connections. Each join and each leave
-//! starts a new generation in both, so nothing of an older connection reaches the window.
+//! (routing restored) and disconnects. Statuses, track states and room messages reach the
+//! window through two [`LatestHub`]s and the [`RoomHub`], which outlive the connections. Each
+//! join and each leave starts a new generation in all three, so nothing of an older connection
+//! reaches the window.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -20,7 +22,9 @@ use streamer_core::audio::{AppInfo, AudioBackend};
 use streamer_core::config::{self, Settings};
 use streamer_core::connection::{JoinKind, build_ws_url};
 use streamer_core::engine::{Phase, Status};
+use streamer_core::http;
 use streamer_core::runtime::StreamerHandle;
+use streamer_core::tracks::TrackStates;
 
 use crate::room_hub::RoomHub;
 
@@ -32,7 +36,8 @@ pub struct AppState {
     /// of the app list (e.g. `PipeWire 1.0 and WirePlumber 0.5 or later required`).
     backend: Result<Arc<dyn AudioBackend>, String>,
     session: tokio::sync::Mutex<Session>,
-    status_hub: Arc<StatusHub>,
+    status_hub: Arc<LatestHub<Status>>,
+    tracks_hub: Arc<LatestHub<TrackStates>>,
     room_hub: Arc<RoomHub<Channel<Value>>>,
     /// Set once the exit cleanup has started.
     pub exit_started: AtomicBool,
@@ -58,7 +63,7 @@ impl AppState {
             Ok(_) => eprintln!("streamer-app: audio backend ready"),
             Err(e) => eprintln!("streamer-app: no audio backend: {e}"),
         }
-        let status_hub = Arc::new(StatusHub::new(settings.nudge_ms));
+        let status_hub = Arc::new(LatestHub::new("status", idle_status(settings.nudge_ms)));
         Self {
             backend,
             session: tokio::sync::Mutex::new(Session {
@@ -67,6 +72,7 @@ impl AppState {
                 closed: false,
             }),
             status_hub,
+            tracks_hub: Arc::new(LatestHub::new("track states", TrackStates::new())),
             room_hub: Arc::new(RoomHub::new()),
             exit_started: AtomicBool::new(false),
             exit_done: AtomicBool::new(false),
@@ -89,18 +95,29 @@ impl AppState {
     /// While no room is joined, the idle status shows the saved nudge.
     fn show_saved_nudge(&self, session: &Session) {
         if session.handle.is_none() {
-            self.status_hub.next_generation(session.settings.nudge_ms);
+            self.status_hub
+                .next_generation(idle_status(session.settings.nudge_ms));
         }
     }
 
-    /// Starts a new generation in both hubs: the window gets the idle status (with the saved
-    /// nudge) and an empty room. Returns the status and the room generation.
-    fn next_generations(&self, settings: &Settings) -> (u64, u64) {
-        (
-            self.status_hub.next_generation(settings.nudge_ms),
-            self.room_hub.next_generation(),
-        )
+    /// Starts a new generation in every hub: the window gets the idle status (with the saved
+    /// nudge), no track states and an empty room.
+    fn next_generations(&self, settings: &Settings) -> Generations {
+        Generations {
+            status: self
+                .status_hub
+                .next_generation(idle_status(settings.nudge_ms)),
+            tracks: self.tracks_hub.next_generation(TrackStates::new()),
+            room: self.room_hub.next_generation(),
+        }
     }
+}
+
+/// The hub generations of one connection.
+struct Generations {
+    status: u64,
+    tracks: u64,
+    room: u64,
 }
 
 #[cfg(target_os = "linux")]
@@ -200,7 +217,7 @@ pub async fn join_room(
     }
 
     let settings = session.settings.clone();
-    let (status_generation, room_generation) = state.next_generations(&settings);
+    let generations = state.next_generations(&settings);
     eprintln!(
         "streamer-app: joining {} room {} as {}",
         settings.server_url, settings.room_id, settings.username
@@ -210,9 +227,16 @@ pub async fn join_room(
     tauri::async_runtime::spawn(pump(
         handle.status(),
         state.status_hub.clone(),
-        status_generation,
+        generations.status,
+        status_logger(),
     ));
-    tauri::async_runtime::spawn(room_pump(feed_rx, state.room_hub.clone(), room_generation));
+    tauri::async_runtime::spawn(pump(
+        handle.tracks(),
+        state.tracks_hub.clone(),
+        generations.tracks,
+        |_| {},
+    ));
+    tauri::async_runtime::spawn(room_pump(feed_rx, state.room_hub.clone(), generations.room));
     session.handle = Some(handle);
     Ok(session.settings.clone())
 }
@@ -259,6 +283,25 @@ pub async fn send_action(state: State<'_, AppState>, action: Value) -> CommandRe
         return Err("Not in a room".to_string());
     };
     handle.send_action(action)
+}
+
+/// Uploads an audio file from `path` (the file dialog or a drop) to the joined room; the server
+/// then adds it to the queue. The session is not locked during the upload, so a leave or a
+/// join does not wait for it; an upload to a room that closed meanwhile fails with the
+/// server's text. Errors are the texts the window shows.
+#[tauri::command]
+pub async fn upload_audio(state: State<'_, AppState>, path: String) -> CommandResult<()> {
+    let (base, room_id) = {
+        let session = state.session.lock().await;
+        if session.handle.is_none() {
+            return Err("Not in a room".to_string());
+        }
+        let base = http::http_base(&session.settings.server_url).map_err(|e| e.to_string())?;
+        (base, session.settings.room_id.clone())
+    };
+    http::upload_audio(&http::client(), &base, &room_id, Path::new(&path))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Apps that play audio now. Blocks a worker thread for up to ~4 s.
@@ -328,6 +371,20 @@ pub async fn subscribe_status(
         .subscribe(webview.label().to_string(), on_status)
 }
 
+/// Sends the current track states at once and then every change, across joins (an empty map
+/// while no room is joined). A new subscription from the same webview (e.g. after a reload)
+/// replaces the old one.
+#[tauri::command]
+pub async fn subscribe_tracks(
+    webview: Webview,
+    state: State<'_, AppState>,
+    on_tracks: Channel<TrackStates>,
+) -> CommandResult<()> {
+    state
+        .tracks_hub
+        .subscribe(webview.label().to_string(), on_tracks)
+}
+
 /// Sends the cached room at once and then every room message, across joins. A new
 /// subscription from the same webview (e.g. after a reload) replaces the old one.
 #[tauri::command]
@@ -341,22 +398,22 @@ pub async fn subscribe_room(
         .subscribe(webview.label().to_string(), on_message)
 }
 
-/// Copies the statuses of one connection to the hub until the connection ends or a new
-/// generation starts.
-async fn pump(mut status: watch::Receiver<Status>, hub: Arc<StatusHub>, generation: u64) {
-    let mut last_logged: Option<String> = None;
+/// Copies the values of one connection's watch to the hub until the connection ends or a new
+/// generation starts. `on_value` sees each value first.
+async fn pump<T: Clone + Serialize>(
+    mut values: watch::Receiver<T>,
+    hub: Arc<LatestHub<T>>,
+    generation: u64,
+    mut on_value: impl FnMut(&T),
+) {
     loop {
-        let current = status.borrow_and_update().clone();
-        let line = log_line(&current);
-        if last_logged.as_ref() != Some(&line) {
-            eprintln!("streamer-app: status {line}");
-            last_logged = Some(line);
-        }
+        let current = values.borrow_and_update().clone();
+        on_value(&current);
         if !hub.publish(generation, current) {
             return;
         }
-        // An error means the engine has ended (shut down): its last status stays.
-        if status.changed().await.is_err() {
+        // An error means the connection has ended (shut down): its last value stays.
+        if values.changed().await.is_err() {
             return;
         }
     }
@@ -372,6 +429,18 @@ async fn room_pump(
     while let Some(msg) = feed.recv().await {
         if !hub.publish(generation, msg) {
             return;
+        }
+    }
+}
+
+/// Logs each status whose [`log_line`] differs from the last one logged.
+fn status_logger() -> impl FnMut(&Status) {
+    let mut last_logged: Option<String> = None;
+    move |status| {
+        let line = log_line(status);
+        if last_logged.as_ref() != Some(&line) {
+            eprintln!("streamer-app: status {line}");
+            last_logged = Some(line);
         }
     }
 }
@@ -409,75 +478,80 @@ fn idle_status(nudge_ms: f64) -> Status {
     }
 }
 
-/// The latest status of the current connection and the UI channels it goes to. Sends happen
-/// under the lock, so a new subscriber gets the latest status first and then every change, in
-/// order.
-struct StatusHub {
-    inner: Mutex<HubInner>,
+/// The latest value of the current connection (its status, its track states) and the UI
+/// channels it goes to. Sends happen under the lock, so a new subscriber gets the latest value
+/// first and then every change, in order.
+struct LatestHub<T> {
+    /// What the values are, for the error texts.
+    what: &'static str,
+    inner: Mutex<HubInner<T>>,
 }
 
-struct HubInner {
-    /// Increased for each join and leave; statuses of older connections are dropped.
+struct HubInner<T> {
+    /// Increased for each join and leave; values of older connections are dropped.
     generation: u64,
-    latest: Status,
+    latest: T,
     /// By webview label.
-    channels: HashMap<String, Channel<Status>>,
+    channels: HashMap<String, Channel<T>>,
 }
 
-impl StatusHub {
-    fn new(nudge_ms: f64) -> Self {
+impl<T: Clone + Serialize> LatestHub<T> {
+    fn new(what: &'static str, initial: T) -> Self {
         Self {
+            what,
             inner: Mutex::new(HubInner {
                 generation: 0,
-                latest: idle_status(nudge_ms),
+                latest: initial,
                 channels: HashMap::new(),
             }),
         }
     }
 
-    fn lock(&self) -> MutexGuard<'_, HubInner> {
+    fn lock(&self) -> MutexGuard<'_, HubInner<T>> {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn subscribe(&self, label: String, channel: Channel<Status>) -> CommandResult<()> {
+    /// Sends the latest value to `channel`, then registers it for the changes. A new channel
+    /// of the same webview replaces the old one.
+    fn subscribe(&self, label: String, channel: Channel<T>) -> CommandResult<()> {
         let mut inner = self.lock();
         channel
             .send(inner.latest.clone())
-            .map_err(|e| format!("Cannot send the status: {e}"))?;
+            .map_err(|e| format!("Cannot send the {}: {e}", self.what))?;
         inner.channels.insert(label, channel);
         Ok(())
     }
 
-    /// Starts a new generation at the idle status with `nudge_ms` and returns it.
-    fn next_generation(&self, nudge_ms: f64) -> u64 {
+    /// Starts a new generation at `initial`, sends it and returns the generation.
+    fn next_generation(&self, initial: T) -> u64 {
         let mut inner = self.lock();
         inner.generation += 1;
-        inner.latest = idle_status(nudge_ms);
-        inner.broadcast();
+        inner.latest = initial;
+        inner.broadcast(self.what);
         inner.generation
     }
 
-    /// False when `generation` is no longer the current one.
-    fn publish(&self, generation: u64, status: Status) -> bool {
+    /// False when `generation` is no longer the current one (nothing changes then).
+    fn publish(&self, generation: u64, value: T) -> bool {
         let mut inner = self.lock();
         if inner.generation != generation {
             return false;
         }
-        inner.latest = status;
-        inner.broadcast();
+        inner.latest = value;
+        inner.broadcast(self.what);
         true
     }
 }
 
-impl HubInner {
-    /// Sends the latest status to every channel; a channel that fails is dropped.
-    fn broadcast(&mut self) {
+impl<T: Clone + Serialize> HubInner<T> {
+    /// Sends the latest value to every channel; a channel that fails is dropped.
+    fn broadcast(&mut self, what: &str) {
         let latest = &self.latest;
         self.channels
             .retain(|label, channel| match channel.send(latest.clone()) {
                 Ok(()) => true,
                 Err(e) => {
-                    eprintln!("streamer-app: dropping the status channel of {label}: {e}");
+                    eprintln!("streamer-app: dropping the {what} channel of {label}: {e}");
                     false
                 }
             });
@@ -486,7 +560,163 @@ impl HubInner {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering;
+
+    use serde_json::json;
+    use streamer_core::tracks::TrackState;
+    use tauri::ipc::InvokeResponseBody;
+
     use super::*;
+
+    /// The window end of hub channels: records what they get as JSON; every send fails while
+    /// `failing` is set.
+    #[derive(Clone, Default)]
+    struct TestWindow {
+        got: Arc<Mutex<Vec<Value>>>,
+        failing: Arc<AtomicBool>,
+    }
+
+    impl TestWindow {
+        fn channel<T>(&self) -> Channel<T> {
+            let window = self.clone();
+            Channel::new(move |body| {
+                if window.failing.load(Ordering::SeqCst) {
+                    return Err(tauri::Error::WebviewNotFound);
+                }
+                let InvokeResponseBody::Json(json) = body else {
+                    panic!("hub values go as JSON");
+                };
+                let value = serde_json::from_str(&json).expect("valid JSON");
+                window.got.lock().unwrap().push(value);
+                Ok(())
+            })
+        }
+
+        fn got(&self) -> Vec<Value> {
+            self.got.lock().unwrap().clone()
+        }
+
+        fn set_failing(&self, failing: bool) {
+            self.failing.store(failing, Ordering::SeqCst);
+        }
+    }
+
+    fn tracks_hub() -> LatestHub<TrackStates> {
+        LatestHub::new("track states", TrackStates::new())
+    }
+
+    fn ready(url: &str, duration_s: f64) -> TrackStates {
+        TrackStates::from([(url.to_string(), TrackState::Ready { duration_s })])
+    }
+
+    fn ready_json(url: &str, duration_s: f64) -> Value {
+        json!({ url: { "state": "ready", "durationS": duration_s } })
+    }
+
+    #[test]
+    fn subscribe_gets_the_latest_value_then_every_change() {
+        // A reloaded window shows the current state at once and then follows the changes: a
+        // gap or a repeat between the two shows a wrong state.
+        let hub = tracks_hub();
+        let generation = hub.next_generation(TrackStates::new());
+        assert!(hub.publish(generation, ready("a.mp3", 2.0)));
+
+        let window = TestWindow::default();
+        hub.subscribe("main".to_string(), window.channel()).unwrap();
+        assert_eq!(window.got(), vec![ready_json("a.mp3", 2.0)]);
+
+        assert!(hub.publish(generation, ready("b.mp3", 3.0)));
+        assert_eq!(
+            window.got(),
+            vec![ready_json("a.mp3", 2.0), ready_json("b.mp3", 3.0)]
+        );
+    }
+
+    #[test]
+    fn a_join_starts_the_tracks_hub_empty() {
+        // After a leave or a new join, the queue must not show the load states of the old
+        // room's tracks.
+        let hub = tracks_hub();
+        let generation = hub.next_generation(TrackStates::new());
+        assert!(hub.publish(generation, ready("a.mp3", 2.0)));
+        let window = TestWindow::default();
+        hub.subscribe("main".to_string(), window.channel()).unwrap();
+
+        hub.next_generation(TrackStates::new());
+        assert_eq!(
+            window.got(),
+            vec![ready_json("a.mp3", 2.0), json!({})],
+            "sent at once"
+        );
+
+        let later = TestWindow::default();
+        hub.subscribe("other".to_string(), later.channel()).unwrap();
+        assert_eq!(later.got(), vec![json!({})], "the latest value");
+    }
+
+    #[test]
+    fn values_of_an_old_generation_are_dropped() {
+        // The old connection still sends after a new join (at least the empty map of its
+        // shutdown): it must not replace the new room's states.
+        let hub = tracks_hub();
+        let old = hub.next_generation(TrackStates::new());
+        let current = hub.next_generation(TrackStates::new());
+        assert!(hub.publish(current, ready("a.mp3", 2.0)));
+        let window = TestWindow::default();
+        hub.subscribe("main".to_string(), window.channel()).unwrap();
+
+        assert!(!hub.publish(old, TrackStates::new()));
+        assert_eq!(window.got(), vec![ready_json("a.mp3", 2.0)], "not sent");
+
+        let later = TestWindow::default();
+        hub.subscribe("other".to_string(), later.channel()).unwrap();
+        assert_eq!(
+            later.got(),
+            vec![ready_json("a.mp3", 2.0)],
+            "not the latest value"
+        );
+    }
+
+    #[test]
+    fn a_failing_channel_is_dropped() {
+        let hub = tracks_hub();
+        let generation = hub.next_generation(TrackStates::new());
+        let healthy = TestWindow::default();
+        let broken = TestWindow::default();
+        hub.subscribe("healthy".to_string(), healthy.channel())
+            .unwrap();
+        hub.subscribe("broken".to_string(), broken.channel())
+            .unwrap();
+
+        broken.set_failing(true);
+        assert!(hub.publish(generation, ready("a.mp3", 2.0)));
+        broken.set_failing(false);
+        assert!(hub.publish(generation, ready("b.mp3", 3.0)));
+        assert_eq!(
+            healthy.got(),
+            vec![
+                json!({}),
+                ready_json("a.mp3", 2.0),
+                ready_json("b.mp3", 3.0)
+            ]
+        );
+        assert_eq!(
+            broken.got(),
+            vec![json!({})],
+            "dropped at the first failure"
+        );
+
+        // A channel that cannot take the latest value is refused.
+        let refused = TestWindow::default();
+        refused.set_failing(true);
+        assert!(
+            hub.subscribe("refused".to_string(), refused.channel())
+                .is_err()
+        );
+        refused.set_failing(false);
+        assert!(hub.publish(generation, ready("c.mp3", 4.0)));
+        assert_eq!(refused.got(), Vec::<Value>::new());
+    }
 
     #[test]
     fn join_rejects_a_bad_room_code_or_server_url() {

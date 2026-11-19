@@ -57,7 +57,10 @@ impl RoomCache {
             Some("ROOM_EVENT") => match message_type(&msg["event"]) {
                 Some("CLIENT_CHANGE") => &mut self.clients,
                 Some("SET_PLAYBACK_CONTROLS") => &mut self.playback_controls,
-                Some("SET_AUDIO_SOURCES") => &mut self.audio_sources,
+                Some("SET_AUDIO_SOURCES") => {
+                    self.drop_playback_of_deleted_track(&msg["event"]);
+                    &mut self.audio_sources
+                }
                 Some("LIVE_STREAM_STATE") => &mut self.live_stream,
                 Some("CHAT_UPDATE") => {
                     self.apply_chat(&msg["event"]);
@@ -77,6 +80,21 @@ impl RoomCache {
             _ => return,
         };
         *slot = Some(msg.clone());
+    }
+
+    /// The server deletes the current track without a PAUSE: a replayed PLAY of it would show a
+    /// deleted track as playing.
+    fn drop_playback_of_deleted_track(&mut self, event: &Value) {
+        let Some(sources) = event["sources"].as_array() else {
+            return;
+        };
+        let playing = self
+            .playback
+            .as_ref()
+            .and_then(|p| p["scheduledAction"]["audioSource"].as_str());
+        if playing.is_some_and(|url| !sources.iter().any(|s| s["url"].as_str() == Some(url))) {
+            self.playback = None;
+        }
     }
 
     /// The web chat store's rule (`store/chat.tsx`): a full sync replaces the messages; an
@@ -144,10 +162,29 @@ impl RoomCache {
 }
 
 /// The room actions the window may send. The core sends the others itself: the clock sync,
-/// the liveness replies, SYNC and this PC's stream.
+/// the liveness replies, SYNC and this PC's stream. MOVE_CLIENT stays refused: the web never
+/// sends it and the server lets anyone move anyone.
 pub fn check_action(action: &Value, streaming: bool) -> Result<(), String> {
     match message_type(action) {
-        Some("SEND_CHAT_MESSAGE" | "SET_ADMIN" | "SET_PLAYBACK_CONTROLS") => Ok(()),
+        Some(
+            "SEND_CHAT_MESSAGE"
+            | "SET_ADMIN"
+            | "SET_PLAYBACK_CONTROLS"
+            | "PLAY"
+            | "PAUSE"
+            | "REORDER_AUDIO_SOURCES"
+            | "DELETE_AUDIO_SOURCES"
+            | "LOAD_DEFAULT_TRACKS"
+            | "SEARCH_MUSIC"
+            | "STREAM_MUSIC"
+            | "SET_GLOBAL_VOLUME"
+            | "SET_LOW_PASS_FREQ"
+            | "SET_METRONOME"
+            | "START_SPATIAL_AUDIO"
+            | "STOP_SPATIAL_AUDIO"
+            | "SET_LISTENING_SOURCE"
+            | "REORDER_CLIENT",
+        ) => Ok(()),
         // The window stops another user's stream. This PC's own stream ends through its own
         // stop, which also restores the routing.
         Some("STOP_LIVE_STREAM") if streaming => {
@@ -289,6 +326,21 @@ mod tests {
     }
 
     #[test]
+    fn a_deleted_track_drops_the_cached_playback() {
+        let play = scheduled(json!({ "type": "PLAY", "trackTimeSeconds": 1, "audioSource": "a" }));
+        let sources = |urls: &[&str]| {
+            let sources: Vec<Value> = urls.iter().map(|url| json!({ "url": url })).collect();
+            room_event(json!({ "type": "SET_AUDIO_SOURCES", "sources": sources }))
+        };
+        let mut cache = RoomCache::default();
+        cache.apply(&play);
+        cache.apply(&sources(&["a", "b"]));
+        assert_eq!(cache.snapshot().len(), 2);
+        cache.apply(&sources(&["b"]));
+        assert_eq!(cache.snapshot(), vec![sources(&["b"])]);
+    }
+
+    #[test]
     fn chat_full_sync_replaces_and_updates_append_newer_ids() {
         // The web chat store's merge rule: an update may repeat messages the full sync had.
         let mut cache = RoomCache::default();
@@ -389,5 +441,42 @@ mod tests {
             );
         }
         assert!(check_action(&json!({ "text": "hi" }), false).is_err());
+    }
+
+    #[test]
+    fn check_action_allows_room_control() {
+        for kind in [
+            "PLAY",
+            "PAUSE",
+            "REORDER_AUDIO_SOURCES",
+            "DELETE_AUDIO_SOURCES",
+            "LOAD_DEFAULT_TRACKS",
+            "SEARCH_MUSIC",
+            "STREAM_MUSIC",
+            "SET_GLOBAL_VOLUME",
+            "SET_LOW_PASS_FREQ",
+            "SET_METRONOME",
+            "START_SPATIAL_AUDIO",
+            "STOP_SPATIAL_AUDIO",
+            "SET_LISTENING_SOURCE",
+            "REORDER_CLIENT",
+        ] {
+            let action = json!({ "type": kind });
+            assert_eq!(check_action(&action, false), Ok(()), "{kind}");
+            assert_eq!(check_action(&action, true), Ok(()), "{kind}");
+        }
+        // The web never sends MOVE_CLIENT, and the server lets anyone move anyone.
+        for kind in [
+            "MOVE_CLIENT",
+            "SEND_IP",
+            "AUDIO_SOURCE_LOADED",
+            "LIVENESS_PONG",
+            "UPDATE_LIVE_STREAM",
+        ] {
+            assert_eq!(
+                check_action(&json!({ "type": kind }), false),
+                Err(format!("Action not allowed: {kind}"))
+            );
+        }
     }
 }

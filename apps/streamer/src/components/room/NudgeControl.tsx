@@ -8,6 +8,8 @@ import { DEFAULT_NUDGE_STEP, type NudgeStep, nextNudgeStep, nudgeLabel } from "@
 import { cn } from "@/lib/utils";
 import { useSessionStore } from "@/store/session";
 
+import { MetronomeButton } from "./MetronomeButton";
+
 export function NudgeControl() {
   const nudgeMs = useSessionStore((s) => s.status.nudgeMs);
   const [step, setStep] = useState<NudgeStep>(DEFAULT_NUDGE_STEP);
@@ -56,6 +58,7 @@ export function NudgeControl() {
           {step}
         </button>
       </div>
+      <MetronomeButton />
     </motion.div>
   );
 }

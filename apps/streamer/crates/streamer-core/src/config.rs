@@ -51,6 +51,14 @@ pub fn config_path() -> PathBuf {
         .join("config.json")
 }
 
+/// `<cache dir>/app.beatsync.streamer/tracks`: the downloaded tracks of the joined room.
+pub fn track_cache_dir() -> PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join(APP_IDENTIFIER)
+        .join("tracks")
+}
+
 /// Loads the settings; a missing or unreadable file gives the defaults. Generates and saves
 /// the `client_id` when there is none yet.
 pub fn load_or_create() -> Settings {
@@ -126,27 +134,7 @@ pub fn save_at(path: &Path, settings: &Settings) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A fresh directory under the system temp dir, removed on drop.
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new(name: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!(
-                "beatsync-streamer-{name}-{}-{}",
-                std::process::id(),
-                crate::clock::mono_ns()
-            ));
-            std::fs::create_dir_all(&dir).unwrap();
-            Self(dir)
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    use crate::test_util::TempDir;
 
     #[test]
     fn config_round_trip_and_client_id_stable() {

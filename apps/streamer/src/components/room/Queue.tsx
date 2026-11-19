@@ -1,61 +1,113 @@
+import {
+  closestCenter,
+  DndContext,
+  type DragEndEvent,
+  MouseSensor,
+  TouchSensor,
+  useSensor,
+  useSensors,
+} from "@dnd-kit/core";
+import { restrictToVerticalAxis, restrictToWindowEdges } from "@dnd-kit/modifiers";
+import { SortableContext, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { AnimatePresence, motion } from "motion/react";
+import { useEffect, useState } from "react";
 
-import { cn, extractFileNameFromUrl } from "@/lib/utils";
-import { useRoomStore } from "@/store/room";
+import { LoadDefaultTracksButton } from "@/components/room/LoadDefaultTracksButton";
+import { QueueItem } from "@/components/room/QueueItem";
+import { sendRoomAction } from "@/lib/actions";
+import { isSelectedPlaying, serverNowMs } from "@/lib/player";
+import { orderByUrls, reorderUrls } from "@/lib/queue";
+import { cn } from "@/lib/utils";
+import { usePlayerStore, selectedUrl } from "@/store/player";
+import { canControl as canControlIn, canMutate as canMutateIn, useRoomStore } from "@/store/room";
+import { useSessionStore } from "@/store/session";
 
-/** The room's queue, read-only. Queue changes come with part 2. */
+/** Re-renders every 500 ms while `active`, so a track that ends stops showing as playing. */
+function useTick(active: boolean) {
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    if (!active) return;
+    const id = setInterval(() => setTick((n) => n + 1), 500);
+    return () => clearInterval(id);
+  }, [active]);
+}
+
+/** Port of the web `Queue`: the sortable queue with play, pause and delete. */
 export function Queue({ className }: { className?: string }) {
   const audioSources = useRoomStore((s) => s.audioSources);
   const currentAudioSource = useRoomStore((s) => s.currentAudioSource);
-  const isPlaying = useRoomStore((s) => s.playback?.kind === "PLAY");
+  const playback = useRoomStore((s) => s.playback);
+  const clientId = useSessionStore((s) => s.settings.clientId);
+  const canMutate = useRoomStore((s) => canMutateIn(s, clientId));
+  const canControl = useRoomStore((s) => canControlIn(s, clientId));
+  const localSelection = usePlayerStore((s) => s.localSelection);
+  const offsetMs = useSessionStore((s) => s.status.offsetMs);
+  const tracks = useSessionStore((s) => s.tracks);
+  // The dragged order shows until the next SET_AUDIO_SOURCES.
+  const [optimisticOrder, setOptimisticOrder] = useState<string[] | null>(null);
+  useEffect(() => setOptimisticOrder(null), [audioSources]);
+
+  const selected = selectedUrl({ audioSources, currentAudioSource }, localSelection);
+  const selectedTrack = selected === null ? undefined : tracks[selected];
+  const selectedDuration = selectedTrack?.state === "ready" ? selectedTrack.durationS : null;
+  useTick(playback?.kind === "PLAY");
+  const playing = isSelectedPlaying(playback, selected, serverNowMs(offsetMs), selectedDuration);
+
+  const sensors = useSensors(
+    useSensor(MouseSensor),
+    useSensor(TouchSensor, { activationConstraint: { delay: 250, tolerance: 5 } })
+  );
+
+  const sources = orderByUrls(audioSources, optimisticOrder);
+
+  const handleDragEnd = ({ active, over }: DragEndEvent) => {
+    if (!canMutate || !over) return;
+    const order = reorderUrls(
+      sources.map((source) => source.url),
+      String(active.id),
+      String(over.id)
+    );
+    if (order === null) return;
+    setOptimisticOrder(order);
+    void sendRoomAction({ type: "REORDER_AUDIO_SOURCES", reorderedAudioSources: order.map((url) => ({ url })) }).then((sent) => {
+      if (!sent) setOptimisticOrder(null);
+    });
+  };
+
+  const items = (
+    <AnimatePresence initial={true}>
+      {sources.map((source, index) => (
+        <QueueItem
+          key={source.url}
+          url={source.url}
+          index={index}
+          isSelected={selected === source.url}
+          isPlaying={playing}
+          canMutate={canMutate}
+          canControl={canControl}
+        />
+      ))}
+    </AnimatePresence>
+  );
 
   return (
-    <div className={className}>
+    <div className={cn("", className)}>
       <div className="space-y-1">
-        {audioSources.length > 0 ? (
-          <AnimatePresence initial={true}>
-            {audioSources.map((source, index) => {
-              const isSelected = currentAudioSource === source.url;
-              const isPlayingThis = isSelected && isPlaying;
-              return (
-                <motion.div
-                  key={source.url}
-                  layout
-                  initial={{ opacity: 0, y: 20 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, y: -10, transition: { duration: 0.25, ease: "easeInOut" } }}
-                  transition={{
-                    layout: { type: "spring", stiffness: 400, damping: 45, mass: 1 },
-                    opacity: { duration: 0.3, delay: Math.min(0.05 * index, 0.3), ease: "easeOut" },
-                    y: { duration: 0.3, delay: Math.min(0.05 * index, 0.3), ease: "easeOut" },
-                  }}
-                  className={cn(
-                    "flex select-none items-center rounded-md py-3 pl-2 pr-4 transition-colors",
-                    isSelected ? "text-white" : "text-neutral-300"
-                  )}
-                >
-                  <div className="flex h-6 w-6 flex-shrink-0 select-none items-center justify-center">
-                    {isPlayingThis ? (
-                      <div className="flex h-4 w-4 items-end justify-center gap-[2px]">
-                        <div className="h-[40%] w-[2px] animate-[sound-wave-1_1.2s_ease-in-out_infinite] bg-primary-500"></div>
-                        <div className="h-[80%] w-[2px] animate-[sound-wave-2_1.4s_ease-in-out_infinite] bg-primary-500"></div>
-                        <div className="h-[60%] w-[2px] animate-[sound-wave-3_1s_ease-in-out_infinite] bg-primary-500"></div>
-                      </div>
-                    ) : (
-                      <span className={cn("text-sm", isSelected ? "text-primary-400" : "text-neutral-400")}>
-                        {index + 1}
-                      </span>
-                    )}
-                  </div>
-                  <div className="ml-3 min-w-0 flex-grow select-none">
-                    <div className={cn("truncate text-sm font-medium", isSelected && "text-primary-400")}>
-                      {extractFileNameFromUrl(source.url)}
-                    </div>
-                  </div>
-                </motion.div>
-              );
-            })}
-          </AnimatePresence>
+        {sources.length > 0 ? (
+          canMutate ? (
+            <DndContext
+              sensors={sensors}
+              onDragEnd={handleDragEnd}
+              collisionDetection={closestCenter}
+              modifiers={[restrictToVerticalAxis, restrictToWindowEdges]}
+            >
+              <SortableContext items={sources.map((source) => source.url)} strategy={verticalListSortingStrategy}>
+                {items}
+              </SortableContext>
+            </DndContext>
+          ) : (
+            items
+          )
         ) : (
           <motion.div
             initial={{ opacity: 0, scale: 0.98 }}
@@ -63,7 +115,14 @@ export function Queue({ className }: { className?: string }) {
             transition={{ duration: 0.2, ease: "easeOut" }}
             className="flex w-full select-none flex-col items-center justify-center gap-3 text-center text-neutral-300"
           >
-            No tracks available
+            {canMutate ? (
+              <>
+                <div className="text-sm text-neutral-400">No tracks yet</div>
+                <LoadDefaultTracksButton />
+              </>
+            ) : (
+              "No tracks available"
+            )}
           </motion.div>
         )}
       </div>

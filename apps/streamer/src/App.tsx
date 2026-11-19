@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 
-import { getSession, subscribeRoom, subscribeStatus } from "@/api";
+import { getSession, subscribeRoom, subscribeStatus, subscribeTracks } from "@/api";
 import { Toaster } from "@/components/ui/sonner";
 import { JoinScreen } from "@/screens/JoinScreen";
 import { RoomScreen } from "@/screens/RoomScreen";
 import { SyncScreen } from "@/screens/SyncScreen";
 import { useRoomStore } from "@/store/room";
+import { useSearchStore } from "@/store/search";
 import { useSessionStore } from "@/store/session";
 
 export function App() {
@@ -19,10 +20,18 @@ export function App() {
   useEffect(() => {
     if (started.current) return;
     started.current = true;
-    const { setStatus, setSession } = useSessionStore.getState();
+    const { setStatus, setSession, setTracks } = useSessionStore.getState();
     const start = async () => {
       await subscribeStatus(setStatus);
-      await subscribeRoom((raw) => useRoomStore.getState().apply(raw));
+      await subscribeTracks(setTracks);
+      await subscribeRoom((raw) => {
+        // The core forwards the search reply as a plain room message.
+        if (typeof raw === "object" && raw !== null && "type" in raw && raw.type === "SEARCH_RESPONSE") {
+          useSearchStore.getState().onResponse(raw);
+        } else {
+          useRoomStore.getState().apply(raw);
+        }
+      });
       setSession(await getSession());
     };
     start()

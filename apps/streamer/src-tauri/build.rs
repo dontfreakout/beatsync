@@ -7,11 +7,13 @@ const COMMANDS: &[&str] = &[
     "leave_room",
     "set_nudge",
     "send_action",
+    "upload_audio",
     "list_apps",
     "start_stream",
     "update_apps",
     "stop_stream",
     "subscribe_status",
+    "subscribe_tracks",
     "subscribe_room",
 ];
 

@@ -4,6 +4,7 @@ import { toast } from "sonner";
 
 import { Bottom } from "@/components/room/Bottom";
 import { Left } from "@/components/room/Left";
+import { InlineSearch } from "@/components/room/InlineSearch";
 import { Queue } from "@/components/room/Queue";
 import { Right } from "@/components/room/Right";
 import { TopBar } from "@/components/room/TopBar";
@@ -28,7 +29,7 @@ function useStatusMessageToast() {
   }, [message]);
 }
 
-/** The three-column layout of the web dashboard's desktop branch; Spatial in the right column is part 2. */
+/** The three-column layout of the web dashboard's desktop branch; the search sits above the queue as in the web `Main`; Spatial in the right column is part 2. */
 export function RoomScreen() {
   useStatusMessageToast();
   return (
@@ -44,7 +45,9 @@ export function RoomScreen() {
           <Left />
           <motion.div className="scrollbar-thin h-full flex-1 overflow-y-auto bg-neutral-950 bg-gradient-to-b from-neutral-900/90 to-neutral-950 backdrop-blur-xl">
             <motion.div className="p-6 pt-4">
-              <h2 className="mb-4 text-sm font-medium text-neutral-300">Queue</h2>
+              <div className="mb-6">
+                <InlineSearch />
+              </div>
               <Queue className="mb-8" />
             </motion.div>
           </motion.div>

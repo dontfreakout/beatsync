@@ -117,7 +117,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 const BACKOFF_SECS: [u64; 5] = [1, 2, 4, 8, 10];
 
-fn install_crypto_provider() {
+pub(crate) fn install_crypto_provider() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();

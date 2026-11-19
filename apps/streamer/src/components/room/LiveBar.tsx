@@ -6,7 +6,6 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { sendRoomAction } from "@/lib/actions";
 import { liveBarMode } from "@/lib/liveBar";
-import { extractFileNameFromUrl } from "@/lib/utils";
 import { canMutate as canMutateClient, useRoomStore } from "@/store/room";
 import { useSessionStore } from "@/store/session";
 
@@ -15,7 +14,6 @@ export function LiveBar() {
   const streamingHere = useSessionStore((s) => isStreaming(s.status.phase));
   const stream = useRoomStore((s) => s.liveStream);
   const canMutate = useRoomStore((s) => canMutateClient(s, clientId));
-  const currentSource = useRoomStore((s) => s.currentAudioSource);
 
   const mode = liveBarMode(streamingHere, stream, clientId);
 
@@ -56,9 +54,5 @@ export function LiveBar() {
     );
   }
 
-  return (
-    <div className="truncate px-2 text-center text-sm text-neutral-300 md:px-4">
-      {currentSource ? extractFileNameFromUrl(currentSource) : "Nothing playing"}
-    </div>
-  );
+  return null;
 }

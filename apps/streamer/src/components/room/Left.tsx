@@ -1,6 +1,7 @@
 import { motion } from "motion/react";
 
 import { Separator } from "@/components/ui/separator";
+import { AudioUploader } from "./AudioUploader";
 import { ConnectedUsersList } from "./ConnectedUsersList";
 import { PlaybackPermissions } from "./PlaybackPermissions";
 import { RoomHeader } from "./RoomHeader";
@@ -19,6 +20,10 @@ export function Left() {
           <ul className="list-outside list-disc space-y-1.5 pl-4">
             <li className="text-xs leading-relaxed">{"Play on speaker directly. Don't use Bluetooth."}</li>
           </ul>
+        </div>
+
+        <div className="pl-1">
+          <AudioUploader />
         </div>
       </motion.div>
     </motion.div>

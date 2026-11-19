@@ -89,6 +89,21 @@ export function subscribeRoom(onMessage: (raw: unknown) => void): Promise<void> 
   return invoke<void>("subscribe_room", { onMessage: channel });
 }
 
+/** The state of a queue track in the core, by the track URL as the server sends it. */
+export type TrackState =
+  | { state: "loading" }
+  | { state: "ready"; durationS: number }
+  | { state: "error"; message: string };
+
+/** Calls `onTracks` with the track states at once (`{}` after a join or leave) and then with every change. */
+export function subscribeTracks(onTracks: (tracks: Record<string, TrackState>) => void): Promise<void> {
+  const channel = new Channel<Record<string, TrackState>>(onTracks);
+  return invoke<void>("subscribe_tracks", { onTracks: channel });
+}
+
+/** Uploads the audio file at `path` to the room; rejects with the server's error text. */
+export const uploadAudio = (path: string) => invoke<void>("upload_audio", { path });
+
 /** The accepted NTP measurements at which the clock counts as synced. */
 export const MAX_SYNC_MEASUREMENTS = 16;
 

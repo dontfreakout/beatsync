@@ -1,21 +1,24 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "The main window: core defaults and the app's own commands",
+  "description": "The main window: core defaults, the file picker and the app's own commands",
   "windows": ["main"],
   "permissions": [
     "core:default",
+    "dialog:allow-open",
     "allow-get-session",
     "allow-save-settings",
     "allow-join-room",
     "allow-leave-room",
     "allow-set-nudge",
     "allow-send-action",
+    "allow-upload-audio",
     "allow-list-apps",
     "allow-start-stream",
     "allow-update-apps",
     "allow-stop-stream",
     "allow-subscribe-status",
+    "allow-subscribe-tracks",
     "allow-subscribe-room"
   ]
 }

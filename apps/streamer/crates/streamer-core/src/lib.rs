@@ -6,9 +6,14 @@ pub mod encoder;
 pub mod engine;
 pub mod frame;
 pub mod gain;
+pub mod http;
+pub mod media;
 pub mod ntp;
 pub mod playout;
 pub mod protocol;
 pub mod room;
 pub mod runtime;
+#[cfg(test)]
+pub(crate) mod test_util;
 pub mod timeline;
+pub mod tracks;

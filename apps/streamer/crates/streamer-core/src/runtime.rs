@@ -10,7 +10,11 @@
 //! - The audio worker (one std thread per audio session) cuts captured chunks into 20 ms
 //!   blocks, stamps them in server time, encodes them for the room and queues the raw PCM for
 //!   the local copy.
+//! - The track loader (app only) downloads the current queue tracks into the cache dir and
+//!   reads their durations; the engine task feeds it the room messages.
 
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle as ThreadHandle;
@@ -19,20 +23,24 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
+use url::Url;
 
 use crate::audio::{
     AppInfo, AudioBackend, AudioError, AudioEvent, AudioIo, CHUNK_MAX_FRAMES, CapturedChunk,
     PlayoutShared,
 };
 use crate::clock::{MonoEpochMap, clock_step_ms, mono_ns};
-use crate::config::Settings;
+use crate::config::{Settings, track_cache_dir};
 use crate::connection::{ConnEvent, JoinKind, Outgoing, build_ws_url, run_connection};
 use crate::encoder::OpusFrameEncoder;
 use crate::engine::{Engine, Input, Output, Phase, Status};
 use crate::frame::{FRAME_DURATION_MS, FRAME_SAMPLES, MAX_DELAY_MS, MIN_DELAY_MS, SAMPLE_RATE};
+use crate::http::{HttpError, client, download, http_base, resolve_audio_url};
+use crate::media::probe_duration;
 use crate::playout::{BLOCK_SAMPLES, CHANNELS, PcmBlock};
 use crate::room;
 use crate::timeline::CaptureTimeline;
+use crate::tracks::{TrackAction, TrackPlanner, TrackStates, track_file_name};
 
 const TICK: Duration = Duration::from_millis(10);
 /// The mono→epoch mapping is measured again this often; a wall-clock step shows up as a jump
@@ -60,6 +68,8 @@ const MAX_SILENT_FILL_NS: i64 = 200_000_000;
 const WORKER_IDLE: Duration = Duration::from_millis(5);
 /// At shutdown, how long queued messages (e.g. STOP_LIVE_STREAM) may take to go out.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+/// K4: a larger track is not downloaded; it shows "Track is larger than 200 MB".
+const MAX_TRACK_BYTES: u64 = 200_000_000;
 
 /// Server time at which the local copy plays the first frame of a block stamped `stamp_ms`:
 /// the room's delay plus the encoder lookahead (receivers hear the decoded Opus that late)
@@ -73,6 +83,7 @@ pub fn local_target_ms(stamp_ms: f64, delay_ms: u32, lookahead_samples: u32, nud
 pub struct StreamerHandle {
     commands: mpsc::UnboundedSender<Command>,
     status: watch::Receiver<Status>,
+    tracks: watch::Receiver<TrackStates>,
     backend: Arc<dyn AudioBackend>,
     /// `None` when the server URL is invalid (the status message says why).
     task: Option<JoinHandle<()>>,
@@ -101,14 +112,26 @@ impl StreamerHandle {
     /// invalid server URL gives a handle that only reports the error in its status.
     ///
     /// `room_feed` gets the raw room messages for the window ([`room::forwarded`]); the CLI
-    /// passes `None`. The app (`JoinKind::App`) also restores the server's stored nudge and
-    /// asks for the room's playback state.
+    /// passes `None`. The app (`JoinKind::App`) also restores the server's stored nudge, asks
+    /// for the room's playback state and downloads the current tracks ([`Self::tracks`]).
     pub async fn connect(
         settings: Settings,
         backend: Arc<dyn AudioBackend>,
         kind: JoinKind,
         room_feed: Option<mpsc::UnboundedSender<serde_json::Value>>,
     ) -> Self {
+        Self::connect_in(settings, backend, kind, room_feed, track_cache_dir()).await
+    }
+
+    /// [`Self::connect`] with the track cache in `cache_dir`.
+    async fn connect_in(
+        settings: Settings,
+        backend: Arc<dyn AudioBackend>,
+        kind: JoinKind,
+        room_feed: Option<mpsc::UnboundedSender<serde_json::Value>>,
+        cache_dir: PathBuf,
+    ) -> Self {
+        let (tracks_tx, tracks) = watch::channel(TrackStates::new());
         let (status_tx, status) = watch::channel(Status {
             connected: false,
             synced: false,
@@ -135,6 +158,7 @@ impl StreamerHandle {
                 return Self {
                     commands,
                     status,
+                    tracks,
                     backend,
                     task: None,
                 };
@@ -157,6 +181,22 @@ impl StreamerHandle {
         let (ev_tx, ev_rx) = mpsc::unbounded_channel();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let connection = tokio::spawn(run_connection(url, out_rx, ev_tx, shutdown_rx));
+        // The CLI downloads nothing and leaves the cache dir, which it shares with the app,
+        // alone.
+        let (loader_feed, loader) = match kind {
+            JoinKind::App => match http_base(&settings.server_url) {
+                Ok(base) => {
+                    let (feed, messages) = mpsc::unbounded_channel();
+                    let loader = TrackLoader::spawn(base, cache_dir, tracks_tx, messages);
+                    (Some(feed), Some(loader))
+                }
+                Err(e) => {
+                    eprintln!("streamer: no track downloads: {e}");
+                    (None, None)
+                }
+            },
+            JoinKind::Streamer => (None, None),
+        };
 
         let (blocks_tx, blocks_rx) = mpsc::channel(BLOCKS_CAPACITY);
         let (notes_tx, notes_rx) = mpsc::unbounded_channel();
@@ -181,6 +221,7 @@ impl StreamerHandle {
             ),
             out_tx: Some(out_tx),
             room_feed,
+            loader_feed,
             audio_tx: Some(audio_tx),
             status_tx,
             shared,
@@ -202,11 +243,13 @@ impl StreamerHandle {
                 connection,
                 shutdown_tx,
                 audio,
+                loader,
             },
         ));
         Self {
             commands,
             status,
+            tracks,
             backend,
             task: Some(task),
         }
@@ -256,12 +299,19 @@ impl StreamerHandle {
         self.status.clone()
     }
 
+    /// The load states of the tracks that became current (app only; the CLI has none).
+    pub fn tracks(&self) -> watch::Receiver<TrackStates> {
+        self.tracks.clone()
+    }
+
     /// Blocks for up to a few seconds; call it from a blocking context.
     pub fn list_apps(&self) -> Result<Vec<AppInfo>, AudioError> {
         self.backend.list_apps()
     }
 
-    /// Stops (restoring the routing), closes the connection and ends all tasks.
+    /// Stops (restoring the routing), closes the connection and ends all tasks. The track
+    /// loader stops its downloads and clears the cache dir before this returns, so a following
+    /// [`Self::connect`] never meets a file of this room.
     pub async fn shutdown(self) {
         self.stop().await;
         let _ = self.commands.send(Command::Shutdown);
@@ -296,6 +346,8 @@ struct Tasks {
     connection: JoinHandle<()>,
     shutdown_tx: watch::Sender<bool>,
     audio: JoinHandle<()>,
+    /// The track loader; ends when the engine task drops its feed.
+    loader: Option<JoinHandle<()>>,
 }
 
 struct EngineTask {
@@ -304,6 +356,8 @@ struct EngineTask {
     out_tx: Option<mpsc::Sender<Outgoing>>,
     /// Where the raw room messages go; `None` for the CLI, or once the receiver is gone.
     room_feed: Option<mpsc::UnboundedSender<serde_json::Value>>,
+    /// The room messages for the track loader; `None` for the CLI, and from shutdown on.
+    loader_feed: Option<mpsc::UnboundedSender<serde_json::Value>>,
     audio_tx: Option<mpsc::UnboundedSender<AudioCmd>>,
     status_tx: watch::Sender<Status>,
     shared: Arc<PlayoutShared>,
@@ -357,6 +411,8 @@ impl EngineTask {
                 _ = remap.tick() => self.remap_clock(),
             }
         }
+        // The loader stops its downloads and clears the cache while the audio stops.
+        self.loader_feed = None;
         self.feed(Input::UserStop);
         // The audio task finishes the queued calls (the stop above included), then ends.
         self.audio_tx = None;
@@ -377,6 +433,9 @@ impl EngineTask {
         let _ = tasks.shutdown_tx.send(true);
         let _ = tasks.connection.await;
         drop(out_tx);
+        if let Some(loader) = tasks.loader {
+            let _ = loader.await;
+        }
     }
 
     /// Measures the mono→epoch offset again. On a wall-clock step the engine moves the server
@@ -405,8 +464,14 @@ impl EngineTask {
 
     fn on_conn_event(&mut self, event: ConnEvent) {
         let input = match event {
-            // For the window only: the engine gets the parsed copy, if any, as the next event.
+            // For the track loader and the window only: the engine gets the parsed copy, if
+            // any, as the next event.
             ConnEvent::Room(message) => {
+                if let Some(loader) = &self.loader_feed
+                    && loader.send(message.clone()).is_err()
+                {
+                    self.loader_feed = None;
+                }
                 if let Some(feed) = &self.room_feed
                     && feed.send(message).is_err()
                 {
@@ -511,6 +576,199 @@ impl EngineTask {
         if let Some(audio_tx) = &self.audio_tx {
             let _ = audio_tx.send(command);
         }
+    }
+}
+
+/// Downloads the tracks that the [`TrackPlanner`] picks into the cache dir and reads their
+/// durations (spec C8). Every state change goes to [`StreamerHandle::tracks`].
+struct TrackLoader {
+    planner: TrackPlanner,
+    client: reqwest::Client,
+    /// Resolves server paths (demo mode).
+    base: Url,
+    cache_dir: PathBuf,
+    states: watch::Sender<TrackStates>,
+    /// The loads that run, by URL.
+    loads: HashMap<String, Load>,
+    next_load_id: u64,
+    done_tx: mpsc::UnboundedSender<LoadDone>,
+}
+
+/// The download and the duration probe of one URL.
+struct Load {
+    id: u64,
+    task: JoinHandle<()>,
+}
+
+struct LoadDone {
+    url: String,
+    /// Tells the late result of a forgotten load from that of a new load of the same URL.
+    id: u64,
+    /// The duration in seconds, or the text the queue shows.
+    result: Result<f64, String>,
+}
+
+impl TrackLoader {
+    /// Clears the cache dir, then loads until `messages` closes. Then it stops the loads,
+    /// clears the cache dir again and publishes an empty map.
+    fn spawn(
+        base: Url,
+        cache_dir: PathBuf,
+        states: watch::Sender<TrackStates>,
+        messages: mpsc::UnboundedReceiver<serde_json::Value>,
+    ) -> JoinHandle<()> {
+        let (done_tx, done_rx) = mpsc::unbounded_channel();
+        let loader = Self {
+            planner: TrackPlanner::default(),
+            client: client(),
+            base,
+            cache_dir,
+            states,
+            loads: HashMap::new(),
+            next_load_id: 0,
+            done_tx,
+        };
+        tokio::spawn(loader.run(messages, done_rx))
+    }
+
+    async fn run(
+        mut self,
+        mut messages: mpsc::UnboundedReceiver<serde_json::Value>,
+        mut done: mpsc::UnboundedReceiver<LoadDone>,
+    ) {
+        // Files of an earlier session that did not end cleanly go first.
+        log_removal(
+            tokio::fs::remove_dir_all(&self.cache_dir).await,
+            &self.cache_dir,
+        );
+        if let Err(e) = tokio::fs::create_dir_all(&self.cache_dir).await {
+            eprintln!(
+                "streamer: cannot create the track cache {}: {e}",
+                self.cache_dir.display()
+            );
+        }
+        loop {
+            let actions = tokio::select! {
+                message = messages.recv() => match message {
+                    Some(message) => self.planner.on_room_message(&message),
+                    None => break,
+                },
+                Some(LoadDone { url, id, result }) = done.recv() => {
+                    if self.loads.get(&url).is_none_or(|load| load.id != id) {
+                        continue;
+                    }
+                    self.loads.remove(&url);
+                    self.planner.on_done(&url, result)
+                }
+            };
+            self.apply(actions).await;
+            self.publish();
+        }
+        for load in self.loads.values() {
+            load.task.abort();
+        }
+        for (_, load) in self.loads.drain() {
+            let _ = load.task.await;
+        }
+        log_removal(
+            tokio::fs::remove_dir_all(&self.cache_dir).await,
+            &self.cache_dir,
+        );
+        self.states.send_replace(TrackStates::new());
+    }
+
+    async fn apply(&mut self, actions: Vec<TrackAction>) {
+        for action in actions {
+            match action {
+                TrackAction::Download { url } => self.start(url),
+                TrackAction::Forget { url } => self.forget(&url).await,
+            }
+        }
+    }
+
+    fn start(&mut self, url: String) {
+        self.next_load_id += 1;
+        let id = self.next_load_id;
+        let source = resolve_audio_url(&self.base, &url);
+        let dest = self.cache_dir.join(track_file_name(&url));
+        let client = self.client.clone();
+        let done = self.done_tx.clone();
+        let task = tokio::spawn({
+            let url = url.clone();
+            async move {
+                let result = load_track(&client, source, &dest, &url).await;
+                let _ = done.send(LoadDone { url, id, result });
+            }
+        });
+        self.loads.insert(url, Load { id, task });
+    }
+
+    /// Stops the URL's load before its file goes. The file operations of the aborted task run on
+    /// the blocking pool and can finish after the abort, so in rare cases a stale file stays
+    /// until the next download of that URL or until leave.
+    async fn forget(&mut self, url: &str) {
+        if let Some(load) = self.loads.remove(url) {
+            load.task.abort();
+            // Resolves once the task is dropped, and with it the download's part file.
+            let _ = load.task.await;
+        }
+        let path = self.cache_dir.join(track_file_name(url));
+        log_removal(tokio::fs::remove_file(&path).await, &path);
+    }
+
+    fn publish(&self) {
+        let states = self.planner.states();
+        self.states.send_if_modified(|published| {
+            let changed = published != states;
+            if changed {
+                published.clone_from(states);
+            }
+            changed
+        });
+    }
+}
+
+/// Downloads one track to `dest` and reads its duration. The error is the text the queue
+/// shows; the cause goes to the log.
+async fn load_track(
+    client: &reqwest::Client,
+    source: Result<Url, HttpError>,
+    dest: &Path,
+    url: &str,
+) -> Result<f64, String> {
+    let downloaded = match source {
+        Ok(source) => download(client, &source, dest, MAX_TRACK_BYTES).await,
+        Err(e) => Err(e),
+    };
+    if let Err(e) = downloaded {
+        eprintln!("streamer: cannot download the track {url}: {e}");
+        return Err(e.to_string());
+    }
+    let path = dest.to_path_buf();
+    match tokio::task::spawn_blocking(move || probe_duration(&path)).await {
+        Ok(Ok(duration_s)) => Ok(duration_s),
+        Ok(Err(e)) => {
+            let cause = std::error::Error::source(&e).map(ToString::to_string);
+            eprintln!(
+                "streamer: cannot read the track {url}: {}",
+                cause.unwrap_or_default()
+            );
+            Err(e.to_string())
+        }
+        // The demuxer panicked: the same text as a `MediaError`.
+        Err(e) => {
+            eprintln!("streamer: reading the track {url} failed: {e}");
+            Err("Cannot play this track".to_string())
+        }
+    }
+}
+
+/// Logs a failed removal; a path that is not there is fine.
+fn log_removal(result: std::io::Result<()>, path: &Path) {
+    if let Err(e) = result
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("streamer: cannot remove {}: {e}", path.display());
     }
 }
 
@@ -858,7 +1116,12 @@ impl BlockAssembler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::http::test_server::{Reply, TestServer};
+    use crate::test_util::TempDir;
+    use crate::tracks::{TrackState, track_file_name};
     use futures_util::SinkExt;
+    use serde_json::{Value, json};
+    use tokio_tungstenite::tungstenite::Message;
 
     #[test]
     fn local_target_includes_lookahead_and_nudge() {
@@ -1037,9 +1300,9 @@ mod tests {
         (listener, settings(url))
     }
 
-    async fn accept(
-        listener: &tokio::net::TcpListener,
-    ) -> tokio_tungstenite::WebSocketStream<tokio::net::TcpStream> {
+    type Ws = tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
+
+    async fn accept(listener: &tokio::net::TcpListener) -> Ws {
         let (socket, _) = tokio::time::timeout(WAIT, listener.accept())
             .await
             .expect("the runtime connects")
@@ -1059,12 +1322,25 @@ mod tests {
             .unwrap_or_else(|_| panic!("timed out waiting until {what}"));
     }
 
+    /// [`StreamerHandle::connect`] for the app with the track cache in `cache`: the loader
+    /// clears its cache dir, and no test may touch the user's.
+    async fn connect_app(
+        settings: Settings,
+        backend: Arc<FakeBackend>,
+        room_feed: Option<mpsc::UnboundedSender<Value>>,
+        cache: &TempDir,
+    ) -> StreamerHandle {
+        StreamerHandle::connect_in(settings, backend, JoinKind::App, room_feed, cache.0.clone())
+            .await
+    }
+
     #[tokio::test]
     async fn room_feed_receives_room_messages() {
         let (listener, settings) = server().await;
         let (feed_tx, mut feed_rx) = mpsc::unbounded_channel();
         let backend = Arc::new(FakeBackend::default());
-        let handle = StreamerHandle::connect(settings, backend, JoinKind::App, Some(feed_tx)).await;
+        let cache = TempDir::new("runtime-feed");
+        let handle = connect_app(settings, backend, Some(feed_tx), &cache).await;
         let mut ws = accept(&listener).await;
         let text = r#"{"type":"ROOM_EVENT","event":{"type":"CLIENT_CHANGE","clients":[{"username":"bob","clientId":"b","isAdmin":true,"joinedAt":1}]}}"#;
         ws.send(tokio_tungstenite::tungstenite::Message::text(text))
@@ -1088,7 +1364,8 @@ mod tests {
         let (listener, settings) = server().await;
         drop(listener);
         let backend = Arc::new(FakeBackend::default());
-        let handle = StreamerHandle::connect(settings, backend, JoinKind::App, None).await;
+        let cache = TempDir::new("runtime-refused");
+        let handle = connect_app(settings, backend, None, &cache).await;
         let chat = serde_json::json!({ "type": "SEND_CHAT_MESSAGE", "text": "hi" });
         assert_eq!(handle.send_action(chat), Err("Not connected".to_string()));
         handle.shutdown().await;
@@ -1100,7 +1377,8 @@ mod tests {
         let (listener, settings) = server().await;
         drop(listener);
         let backend = Arc::new(FakeBackend::default());
-        let handle = StreamerHandle::connect(settings, backend, JoinKind::App, None).await;
+        let cache = TempDir::new("runtime-connect-error");
+        let handle = connect_app(settings, backend, None, &cache).await;
         let status = handle.status();
         wait_until("the status has the connect error", || {
             status
@@ -1119,11 +1397,224 @@ mod tests {
         // apps must not stay routed into the sink.
         let (listener, settings) = server().await;
         let backend = Arc::new(FakeBackend::default());
-        let handle = StreamerHandle::connect(settings, backend.clone(), JoinKind::App, None).await;
+        let cache = TempDir::new("runtime-shutdown");
+        let handle = connect_app(settings, backend.clone(), None, &cache).await;
         let _ws = accept(&listener).await;
         handle.start(vec!["app".to_string()], 1000);
         wait_until("the backend starts", || backend.calls().contains(&"start")).await;
         handle.shutdown().await;
         assert_eq!(backend.calls(), ["start", "stop"]);
+    }
+
+    async fn send(ws: &mut Ws, message: Value) {
+        ws.send(Message::text(message.to_string())).await.unwrap();
+    }
+
+    fn queue(urls: &[&str]) -> Value {
+        let sources: Vec<Value> = urls.iter().map(|url| json!({ "url": url })).collect();
+        json!({
+            "type": "ROOM_EVENT",
+            "event": { "type": "SET_AUDIO_SOURCES", "sources": sources },
+        })
+    }
+
+    fn play(url: &str) -> Value {
+        json!({
+            "type": "SCHEDULED_ACTION",
+            "serverTimeToExecute": 1000,
+            "scheduledAction": { "type": "PLAY", "audioSource": url, "trackTimeSeconds": 0 },
+        })
+    }
+
+    /// Serves the 2 s tone at /tone.mp3, an HTML error page at /page.mp3 and, at
+    /// /stalled.mp3, a body that stops halfway; anything else is a 404.
+    async fn track_server() -> TestServer {
+        let tone = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/media/tone.mp3"),
+        )
+        .unwrap();
+        TestServer::start(move |request| match request.target.as_str() {
+            "/tone.mp3" => Reply::bytes(tone.clone()),
+            "/page.mp3" => Reply::bytes(b"<!DOCTYPE html><html><body>Oops</body></html>".to_vec()),
+            "/stalled.mp3" => Reply::bytes(vec![0; 100_000]).stalled_after(50_000),
+            _ => Reply::text(404, "Not found"),
+        })
+        .await
+    }
+
+    /// The app joined to a fresh local room server, with its track cache in `cache`.
+    async fn join_app(cache: &TempDir) -> (StreamerHandle, Ws, tokio::net::TcpListener) {
+        let (listener, settings) = server().await;
+        let backend = Arc::new(FakeBackend::default());
+        let handle = connect_app(settings, backend, None, cache).await;
+        let ws = accept(&listener).await;
+        (handle, ws, listener)
+    }
+
+    fn state(tracks: &watch::Receiver<TrackStates>, url: &str) -> Option<TrackState> {
+        tracks.borrow().get(url).cloned()
+    }
+
+    fn is_ready(tracks: &watch::Receiver<TrackStates>, url: &str) -> bool {
+        matches!(state(tracks, url), Some(TrackState::Ready { .. }))
+    }
+
+    /// Plays the tone and the stalled track; returns when the tone is ready and the stalled
+    /// download has written part of its body.
+    async fn play_tone_and_stalled(
+        ws: &mut Ws,
+        tracks: &watch::Receiver<TrackStates>,
+        cache: &TempDir,
+        tone: &str,
+        stalled: &str,
+    ) {
+        send(ws, queue(&[tone, stalled])).await;
+        send(ws, play(tone)).await;
+        send(ws, play(stalled)).await;
+        let part = cache.0.join(format!("{}.part", track_file_name(stalled)));
+        wait_until(
+            "the tone is ready and the stalled download has data",
+            || is_ready(tracks, tone) && std::fs::metadata(&part).is_ok_and(|m| m.len() > 0),
+        )
+        .await;
+        assert_eq!(state(tracks, stalled), Some(TrackState::Loading));
+    }
+
+    #[tokio::test]
+    async fn a_played_track_becomes_ready_with_its_duration() {
+        let http = track_server().await;
+        let url = http.url("/tone.mp3").to_string();
+        let cache = TempDir::new("tracks-ready");
+        let (handle, mut ws, _listener) = join_app(&cache).await;
+        let tracks = handle.tracks();
+
+        send(&mut ws, queue(&[&url])).await;
+        send(&mut ws, play(&url)).await;
+        wait_until("the track is ready", || is_ready(&tracks, &url)).await;
+
+        let Some(TrackState::Ready { duration_s }) = state(&tracks, &url) else {
+            unreachable!()
+        };
+        assert!((duration_s - 2.0).abs() <= 0.06, "{duration_s}");
+        // The file stays while the track is in the queue (part 3 plays it).
+        assert_eq!(cache.files(), [track_file_name(&url)]);
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_download_marks_the_track_error() {
+        // Review Focus 1: the queue shows why the track does not load, and nothing hangs.
+        let http = track_server().await;
+        let missing = http.url("/missing.mp3").to_string();
+        let page = http.url("/page.mp3").to_string();
+        let cache = TempDir::new("tracks-error");
+        let (handle, mut ws, _listener) = join_app(&cache).await;
+        let tracks = handle.tracks();
+
+        send(&mut ws, queue(&[&missing, &page])).await;
+        send(&mut ws, play(&missing)).await;
+        send(&mut ws, play(&page)).await;
+        wait_until("both tracks are errors", || {
+            let states = tracks.borrow();
+            [&missing, &page]
+                .iter()
+                .all(|url| matches!(states.get(*url), Some(TrackState::Error { .. })))
+        })
+        .await;
+
+        let error = |message: &str| {
+            Some(TrackState::Error {
+                message: message.to_string(),
+            })
+        };
+        assert_eq!(
+            state(&tracks, &missing),
+            error("Download failed: 404 Not Found")
+        );
+        assert_eq!(state(&tracks, &page), error("Cannot play this track"));
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_track_removed_from_the_queue_is_deleted() {
+        // A deleted track must not keep its file, nor its unfinished download a part file.
+        let http = track_server().await;
+        let tone = http.url("/tone.mp3").to_string();
+        let stalled = http.url("/stalled.mp3").to_string();
+        let cache = TempDir::new("tracks-forget");
+        let (handle, mut ws, _listener) = join_app(&cache).await;
+        let tracks = handle.tracks();
+        play_tone_and_stalled(&mut ws, &tracks, &cache, &tone, &stalled).await;
+
+        send(&mut ws, queue(&[])).await;
+        wait_until("the tracks and their files are gone", || {
+            tracks.borrow().is_empty() && cache.files().is_empty()
+        })
+        .await;
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn leave_clears_the_tracks_and_the_cache() {
+        // Review Focus 2: after leave, no track state, download or file of the old room is
+        // left, and the next join starts clean.
+        let http = track_server().await;
+        let tone = http.url("/tone.mp3").to_string();
+        let stalled = http.url("/stalled.mp3").to_string();
+        let cache = TempDir::new("tracks-leave");
+        let (handle, mut ws, listener) = join_app(&cache).await;
+        let tracks = handle.tracks();
+        play_tone_and_stalled(&mut ws, &tracks, &cache, &tone, &stalled).await;
+
+        handle.shutdown().await;
+        assert_eq!(cache.files(), Vec::<String>::new());
+        assert!(tracks.borrow().is_empty());
+
+        // A file left by a crash goes when the next join starts.
+        std::fs::create_dir_all(&cache.0).unwrap();
+        std::fs::write(cache.0.join("old.mp3"), b"old").unwrap();
+        let backend = Arc::new(FakeBackend::default());
+        let settings = settings(format!("ws://{}/ws", listener.local_addr().unwrap()));
+        let handle = connect_app(settings, backend, None, &cache).await;
+        let _ws = accept(&listener).await;
+        assert!(handle.tracks().borrow().is_empty());
+        wait_until("the old file is gone", || cache.files().is_empty()).await;
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_cli_downloads_nothing() {
+        // The CLI shares the cache dir with the app: it neither downloads into it nor clears
+        // it.
+        let http = track_server().await;
+        let url = http.url("/tone.mp3").to_string();
+        let cache = TempDir::new("tracks-cli");
+        std::fs::write(cache.0.join("app-track.mp3"), b"x").unwrap();
+        let (listener, settings) = server().await;
+        let (feed_tx, mut feed_rx) = mpsc::unbounded_channel();
+        let backend = Arc::new(FakeBackend::default());
+        let handle = StreamerHandle::connect_in(
+            settings,
+            backend,
+            JoinKind::Streamer,
+            Some(feed_tx),
+            cache.0.clone(),
+        )
+        .await;
+        let mut ws = accept(&listener).await;
+
+        send(&mut ws, queue(&[&url])).await;
+        send(&mut ws, play(&url)).await;
+        for _ in 0..2 {
+            tokio::time::timeout(WAIT, feed_rx.recv())
+                .await
+                .expect("the core gets the message");
+        }
+        // The core has the PLAY; give a loader time to act on it.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(http.requests().is_empty(), "{:?}", http.requests());
+        assert!(handle.tracks().borrow().is_empty());
+        handle.shutdown().await;
+        assert_eq!(cache.files(), ["app-track.mp3"]);
     }
 }
