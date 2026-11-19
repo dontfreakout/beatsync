@@ -1,6 +1,6 @@
 //! The PipeWire thread: main loop, context and core on a dedicated thread. Commands come in
 //! through a `pipewire::channel`; replies go back through std channels, failures while
-//! started through `AudioIo::events`.
+//! started through `AudioIo::events`, failures of the output through `OutputIo::events`.
 //!
 //! PipeWire callbacks only record what happened in an [`Inbox`]; [`Worker::work`] acts on it
 //! after each loop iteration, so no PipeWire call runs inside a callback.
@@ -24,11 +24,12 @@ use pw::stream::StreamState;
 use pw::types::ObjectType;
 
 use super::capture::connect_capture;
-use super::playback::{NO_LOCAL_OUTPUT, connect_playback, local_copy_allowed};
+use super::playback::{NO_LOCAL_OUTPUT, PlaybackStream, connect_playback, local_copy_allowed};
 use super::routing::{Session, SinkGlobal, sink_name, sink_properties};
 use super::{INIT_TIMEOUT, OWN_APP_NAME, SINK_TIMEOUT, STOP_TIMEOUT};
 use crate::audio::apps::{MetaValue, StreamNode, check_versions, group_apps};
-use crate::audio::{AppInfo, AudioError, AudioIo};
+use crate::audio::{AppInfo, AudioError, AudioEvent, AudioIo, OutputIo};
+use crate::mixer::Mixer;
 
 pub(super) type Reply<T> = mpsc::Sender<Result<T, AudioError>>;
 
@@ -47,7 +48,15 @@ pub(super) enum Command {
         reply: Reply<()>,
     },
     Stop(Reply<()>),
-    /// Stops routing if started, then ends the thread.
+    /// Opens the output, after closing an open one. Without `target` (a `node.name`) it
+    /// follows the default output; tests pin it to their own sink.
+    OpenOutput {
+        io: OutputIo,
+        target: Option<String>,
+        reply: Reply<()>,
+    },
+    CloseOutput(Reply<()>),
+    /// Stops routing if started, closes the output, then ends the thread.
     Quit,
     /// Writes a `target.object` entry for `subject` (tests provoke a refused write).
     #[cfg(test)]
@@ -55,19 +64,37 @@ pub(super) enum Command {
         subject: u32,
         reply: Reply<()>,
     },
+    /// Creates a null sink named `name` that lives as long as the thread (a target that
+    /// tests can play to without a sound).
+    #[cfg(test)]
+    CreateSink {
+        name: String,
+        reply: Reply<()>,
+    },
+    /// From now on the worker takes `value` as the `default.audio.sink` metadata value, as
+    /// after a change of the default output. The real default output stays as it is.
+    #[cfg(test)]
+    FakeDefaultSink {
+        value: String,
+        reply: Reply<()>,
+    },
 }
 
 /// A command and when its caller stops waiting for the answer.
 pub(super) struct Request {
     pub command: Command,
-    /// After this a `Start`, `UpdateApps` or `ListApps` is dropped unrun, so nothing happens
-    /// that no caller hears about. `Stop` and `Quit` only undo, so they always run.
+    /// After this a `Start`, `UpdateApps`, `OpenOutput` or `ListApps` is dropped unrun, so
+    /// nothing happens that no caller hears about. `Stop`, `CloseOutput` and `Quit` only
+    /// undo, so they always run.
     pub expires: Option<Instant>,
 }
 
 impl Request {
     fn is_expired(&self, now: Instant) -> bool {
-        let undoes = matches!(self.command, Command::Stop(_) | Command::Quit);
+        let undoes = matches!(
+            self.command,
+            Command::Stop(_) | Command::CloseOutput(_) | Command::Quit
+        );
         !undoes && self.expires.is_some_and(|at| now >= at)
     }
 }
@@ -137,6 +164,13 @@ struct Stopping {
     sync: Option<i32>,
     deadline: Instant,
     replies: Vec<Reply<()>>,
+}
+
+/// The output: one playback stream for the whole connection, independent of the session.
+struct Output {
+    stream: PlaybackStream,
+    /// Where its failure goes.
+    events: tokio::sync::mpsc::UnboundedSender<AudioEvent>,
 }
 
 /// Runs the PipeWire thread until `Quit`. Sends the outcome of connecting and the version
@@ -304,12 +338,19 @@ struct Worker {
     init: Option<Init>,
     session: Option<Session>,
     stopping: Option<Stopping>,
+    output: Option<Output>,
     /// Set when the connection to PipeWire is gone.
     lost: Option<String>,
     quit: bool,
     sinks_created: u32,
     /// Capture and playback streams created, for their ids.
     media_created: u64,
+    /// Sinks of [`Command::CreateSink`]; dropping a proxy destroys its sink.
+    #[cfg(test)]
+    test_sinks: Vec<Node>,
+    /// The `default.audio.sink` value of [`Command::FakeDefaultSink`].
+    #[cfg(test)]
+    fake_default_sink: Option<String>,
 }
 
 impl Worker {
@@ -333,10 +374,15 @@ impl Worker {
             }),
             session: None,
             stopping: None,
+            output: None,
             lost: None,
             quit: false,
             sinks_created: 0,
             media_created: 0,
+            #[cfg(test)]
+            test_sinks: Vec::new(),
+            #[cfg(test)]
+            fake_default_sink: None,
         };
         let seq = worker.sync();
         if let Some(init) = &mut worker.init {
@@ -429,6 +475,7 @@ impl Worker {
             if let Some(session) = &mut self.session {
                 session.fail(message);
             }
+            self.fail_output("the connection to PipeWire was lost".to_string());
             return;
         }
         if let Some(session) = &mut self.session
@@ -694,9 +741,17 @@ impl Worker {
                     let _ = reply.send(Ok(()));
                 }
                 Command::Stop(reply) => self.begin_stop(Some(reply), now),
+                Command::OpenOutput { io, target, reply } => {
+                    let _ = reply.send(self.open_output(io, target.as_deref()));
+                }
+                Command::CloseOutput(reply) => {
+                    self.output = None;
+                    let _ = reply.send(Ok(()));
+                }
                 Command::Quit => {
                     self.quit = true;
                     self.begin_stop(None, now);
+                    self.output = None;
                 }
                 #[cfg(test)]
                 Command::WriteTarget { subject, reply } => {
@@ -704,6 +759,20 @@ impl Worker {
                         let proxy = &metadata.bound.proxy;
                         proxy.set_property(subject, "target.object", Some("Spa:Id"), Some("0"));
                     }
+                    let _ = reply.send(Ok(()));
+                }
+                #[cfg(test)]
+                Command::CreateSink { name, reply } => {
+                    let sink = self
+                        .core
+                        .create_object::<Node>("adapter", &sink_properties(&name));
+                    let result = sink.map(|sink| self.test_sinks.push(sink));
+                    let _ = reply.send(result.map_err(|e| AudioError::Backend(e.to_string())));
+                }
+                #[cfg(test)]
+                Command::FakeDefaultSink { value, reply } => {
+                    self.fake_default_sink = Some(value);
+                    self.guard_local_output();
                     let _ = reply.send(Ok(()));
                 }
             }
@@ -810,93 +879,119 @@ impl Worker {
         }
     }
 
-    /// Creates the capture of the sink's monitor and the local copy on the default output,
-    /// once the sink exists and the first routing ran.
+    /// Creates the capture of the sink's monitor once the sink exists and the first routing
+    /// ran. When the default output is one of our sinks, the session fails with no capture:
+    /// the output, which follows the default output, would play into the capture.
     fn start_media(&mut self) {
         let capture_id = self.next_media_id();
-        let playback_id = self.next_media_id();
         let on_capture_state = self.state_recorder(capture_id);
-        let on_playback_state = self.state_recorder(playback_id);
-        let allowed = {
-            let inbox = self.inbox.borrow();
-            local_copy_allowed(inbox.default_sink.as_deref(), std::process::id())
-        };
+        let allowed = self.default_output_allowed();
         let Some(session) = &mut self.session else {
             return;
         };
         if !session.is_routing() {
             return;
         }
-        let Some(ends) = session.take_ends() else {
+        if !allowed {
+            session.fail(NO_LOCAL_OUTPUT);
+            return;
+        }
+        let Some(capture_tx) = session.take_capture_tx() else {
             return;
         };
-        let shared = session.shared.clone();
         let capture = connect_capture(
             &self.core,
             &session.sink_name,
-            ends.capture_tx,
-            shared.clone(),
+            capture_tx,
+            session.shared.clone(),
             capture_id,
             on_capture_state,
         );
         match capture {
             Ok(stream) => session.capture = Some(stream),
-            Err(e) => {
-                session.fail(&format!("Cannot capture the Beatsync sink: {e}"));
-                return;
-            }
-        }
-        if !allowed {
-            session.fail(NO_LOCAL_OUTPUT);
-            return;
-        }
-        let playback = connect_playback(
-            &self.core,
-            None,
-            ends.playout_rx,
-            shared,
-            playback_id,
-            on_playback_state,
-        );
-        match playback {
-            Ok(stream) => session.playback = Some(stream),
-            Err(e) => session.fail(&format!("Cannot play the local copy: {e}")),
+            Err(e) => session.fail(&format!("Cannot capture the Beatsync sink: {e}")),
         }
     }
 
-    /// A stream error, or a stream the server disconnected, fails the session. The dead
-    /// stream is dropped at once, so it sends nothing more to the server.
+    /// Whether the default output is not one of this process's sinks.
+    fn default_output_allowed(&self) -> bool {
+        #[cfg(test)]
+        if let Some(value) = &self.fake_default_sink {
+            return local_copy_allowed(Some(value), std::process::id());
+        }
+        let inbox = self.inbox.borrow();
+        local_copy_allowed(inbox.default_sink.as_deref(), std::process::id())
+    }
+
+    /// Opens the output with a [`Mixer`] of `io`, after closing an open one.
+    fn open_output(&mut self, io: OutputIo, target: Option<&str>) -> Result<(), AudioError> {
+        self.output = None;
+        if let Some(lost) = &self.lost {
+            return Err(AudioError::Backend(lost.clone()));
+        }
+        let id = self.next_media_id();
+        let on_state = self.state_recorder(id);
+        let OutputIo {
+            stream_rx,
+            track_rx,
+            metronome,
+            lowpass,
+            shared,
+            events,
+        } = io;
+        let mixer = Mixer::new(stream_rx, track_rx, metronome, shared.clone(), lowpass);
+        let stream = connect_playback(&self.core, target, mixer, shared, id, on_state)
+            .map_err(AudioError::Backend)?;
+        self.output = Some(Output { stream, events });
+        // While a session streams, the rule for a change of the default output applies.
+        self.guard_local_output();
+        Ok(())
+    }
+
+    /// Closes the output and reports `reason`; a running session goes on.
+    fn fail_output(&mut self, reason: String) {
+        if let Some(Output { stream, events }) = self.output.take() {
+            drop(stream);
+            let _ = events.send(AudioEvent::OutputFailed(reason));
+        }
+    }
+
+    /// A stream error, or a stream the server disconnected: the dead stream is dropped at
+    /// once, so it sends nothing more to the server. A failed capture fails the session; a
+    /// failed output closes only the output.
     fn on_stream_states(&mut self, states: Vec<(u64, StreamState)>) {
-        let Some(session) = &mut self.session else {
-            return;
-        };
         for (id, state) in states {
-            let reason = match state {
-                StreamState::Error(message) => format!("failed: {message}"),
-                StreamState::Unconnected => "was disconnected".to_string(),
+            let (reason, output_reason) = match state {
+                StreamState::Error(message) => (format!("failed: {message}"), message),
+                StreamState::Unconnected => (
+                    "was disconnected".to_string(),
+                    "the stream was disconnected".to_string(),
+                ),
                 StreamState::Connecting | StreamState::Paused | StreamState::Streaming => continue,
             };
-            if let Some(label) = session.remove_stream(id) {
+            if self.output.as_ref().is_some_and(|o| o.stream.id == id) {
+                self.fail_output(output_reason);
+            } else if let Some(session) = &mut self.session
+                && let Some(label) = session.remove_stream(id)
+            {
                 session.fail(&format!("{label} {reason}"));
             }
         }
     }
 
     /// The default output became one of our sinks (for example, the last real device went
-    /// away): the local copy would loop into the capture, so it stops and the session fails.
+    /// away): the output, which follows it, now plays into the capture. The capture stops at
+    /// once, so no frame of the PC's own output reaches the room, and the session fails; its
+    /// stop restores the routing and removes the sink. The output stays open.
     fn guard_local_output(&mut self) {
-        let allowed = {
-            let inbox = self.inbox.borrow();
-            local_copy_allowed(inbox.default_sink.as_deref(), std::process::id())
-        };
-        if allowed {
+        if self.default_output_allowed() {
             return;
         }
         if let Some(session) = &mut self.session
-            && let Some(playback) = session.playback.take()
+            && session.capture.is_some()
         {
-            drop(playback);
             session.fail(NO_LOCAL_OUTPUT);
+            drop(session.capture.take());
         }
     }
 

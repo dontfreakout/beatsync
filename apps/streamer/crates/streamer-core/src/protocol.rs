@@ -35,6 +35,20 @@ pub enum ClientMessage {
         label: String,
     },
     StopLiveStream,
+    /// Asks for the room's playback state; while a track plays, the server answers this
+    /// client with a scheduled PLAY.
+    Sync,
+    /// Answers a `LOAD_AUDIO_SOURCE`: this client is done loading the track (or failed). The
+    /// server starts a play once every client that loads queue tracks answered, or after 3 s.
+    AudioSourceLoaded {
+        source: AudioSource,
+    },
+}
+
+/// A queue track, as the server names it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AudioSource {
+    pub url: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -102,6 +116,13 @@ pub enum ScheduledAction {
         gains: HashMap<String, SpatialGain>,
     },
     StopSpatialAudio,
+    LowPassConfig {
+        freq: f64,
+        ramp_time: f64,
+    },
+    MetronomeConfig {
+        enabled: bool,
+    },
     #[serde(other)]
     Other,
 }
@@ -119,6 +140,10 @@ pub enum ClientKind {
     #[default]
     Web,
     Streamer,
+    App,
+    /// A kind added later: it must not break parsing of the client list.
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -129,6 +154,9 @@ pub struct ClientData {
     pub is_admin: bool,
     #[serde(default)]
     pub kind: ClientKind,
+    /// The nudge the server stores for this client (0 when absent).
+    #[serde(default)]
+    pub nudge_ms: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -147,4 +175,20 @@ pub struct LiveStream {
 pub enum RejectReason {
     NotAllowed,
     AlreadyActive,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_kind_app_and_unknown() {
+        let parse = |kind: &str| -> ClientKind {
+            let json =
+                format!(r#"{{"username":"a","clientId":"1","isAdmin":false,"kind":"{kind}"}}"#);
+            serde_json::from_str::<ClientData>(&json).unwrap().kind
+        };
+        assert_eq!(parse("app"), ClientKind::App);
+        assert_eq!(parse("tv"), ClientKind::Other); // a later kind must not break this build
+    }
 }

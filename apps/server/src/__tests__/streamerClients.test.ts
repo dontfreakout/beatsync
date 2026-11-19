@@ -1,13 +1,14 @@
 // Streamer clients (native live-stream source) never load queue tracks and have no admin UI. Loading coordination
 // must not wait for them, and auto-promotion must never leave web users without an admin because of them.
 
-import type { WSBroadcastType } from "@beatsync/shared";
+import type { ClientKind, WSBroadcastType } from "@beatsync/shared";
 import type { PlayActionType } from "@beatsync/shared/types/WSRequest";
 import { afterEach, beforeEach, describe, expect, it, mock, vi } from "bun:test";
 import { mockR2 } from "@/__tests__/mocks/r2";
 import { createMockServer, createMockWs } from "@/__tests__/mocks/websocket";
 import { RoomManager } from "@/managers/RoomManager";
 import type { BunServer } from "@/utils/websocket";
+import { parseClientKind } from "@/utils/websocket";
 
 let broadcastMessages: { server: BunServer; roomId: string; message: WSBroadcastType }[] = [];
 
@@ -33,7 +34,7 @@ void mock.module("@/utils/responses", () => ({
 const ROOM_ID = "test-room";
 const AUDIO_URL = "https://example.com/song.mp3";
 
-function join(room: RoomManager, clientId: string, kind: "web" | "streamer" = "web") {
+function join(room: RoomManager, clientId: string, kind: ClientKind = "web") {
   room.addClient(createMockWs({ clientId, kind }));
 }
 
@@ -102,5 +103,63 @@ describe("Streamer clients", () => {
     room.removeClient("A");
 
     expect(isAdmin(room, "S")).toBe(false);
+  });
+
+  it("PLAY waits for an app client to load the track", () => {
+    join(room, "A");
+    join(room, "B");
+    join(room, "P", "app");
+
+    const play: PlayActionType = { type: "PLAY", audioSource: AUDIO_URL, trackTimeSeconds: 0 };
+    room.initiateAudioSourceLoad(play, "A", server);
+    room.processClientLoadedAudioSource("A", server);
+    room.processClientLoadedAudioSource("B", server);
+    expect(broadcastMessages.filter((m) => m.message.type === "SCHEDULED_ACTION")).toHaveLength(0);
+
+    room.processClientLoadedAudioSource("P", server);
+    expect(broadcastMessages.filter((m) => m.message.type === "SCHEDULED_ACTION")).toHaveLength(1);
+  });
+
+  it("PLAY with only an app client waits for its ack", () => {
+    join(room, "P", "app");
+
+    const play: PlayActionType = { type: "PLAY", audioSource: AUDIO_URL, trackTimeSeconds: 0 };
+    room.initiateAudioSourceLoad(play, "P", server);
+    expect(broadcastMessages.filter((m) => m.message.type === "SCHEDULED_ACTION")).toHaveLength(0);
+
+    room.processClientLoadedAudioSource("P", server);
+    expect(broadcastMessages.filter((m) => m.message.type === "SCHEDULED_ACTION")).toHaveLength(1);
+  });
+
+  it("an app client that joins where only a streamer is admin becomes admin", () => {
+    join(room, "S", "streamer");
+    join(room, "P", "app");
+    expect(isAdmin(room, "P")).toBe(true);
+  });
+
+  it("a web client that joins where an app client is admin does not become admin", () => {
+    join(room, "P", "app");
+    join(room, "A");
+    expect(isAdmin(room, "A")).toBe(false);
+  });
+
+  it("auto-promotion can pick an app client", () => {
+    join(room, "A");
+    join(room, "P", "app");
+    vi.advanceTimersByTime(1000);
+    room.markClientSeen("P");
+
+    room.removeClient("A");
+
+    expect(isAdmin(room, "P")).toBe(true);
+  });
+});
+
+describe("parseClientKind", () => {
+  it("maps known kinds and falls back to web", () => {
+    expect(parseClientKind("app")).toBe("app");
+    expect(parseClientKind("streamer")).toBe("streamer");
+    expect(parseClientKind("tv")).toBe("web");
+    expect(parseClientKind(null)).toBe("web");
   });
 });

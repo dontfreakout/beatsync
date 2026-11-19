@@ -11,14 +11,12 @@ use pw::node::Node;
 use pw::properties::{PropertiesBox, properties};
 
 use super::capture::CaptureStream;
-use super::playback::PlaybackStream;
 use super::thread::Reply;
 use super::{RESTORE_RACE, ROUTE_DEBOUNCE};
 use crate::audio::apps::{
     MetaValue, RouteAction, StreamNode, app_key, moved_away, routing_actions,
 };
 use crate::audio::{AudioError, AudioEvent, AudioIo, CapturedChunk, PlayoutShared};
-use crate::playout::PcmBlock;
 
 const TARGET_OBJECT: &str = "target.object";
 
@@ -59,7 +57,8 @@ pub(super) struct SinkGlobal {
     pub serial: String,
 }
 
-/// One start..stop run: the sink, the selection and the streams moved to the sink.
+/// One start..stop run: the sink, its capture, the selection and the streams moved to the
+/// sink. The output is not part of it.
 pub(super) struct Session {
     pub sink_name: String,
     /// Dropping the proxy destroys the sink on the server.
@@ -80,16 +79,9 @@ pub(super) struct Session {
     failed: bool,
     events: tokio::sync::mpsc::UnboundedSender<AudioEvent>,
     pub shared: Arc<PlayoutShared>,
-    /// The ring ends, until the capture and the playback stream take them.
-    ends: Option<MediaEnds>,
+    /// The capture ring's end, until the capture stream takes it.
+    capture_tx: Option<rtrb::Producer<CapturedChunk>>,
     pub capture: Option<CaptureStream>,
-    pub playback: Option<PlaybackStream>,
-}
-
-/// The ring ends of the real-time streams.
-pub(super) struct MediaEnds {
-    pub capture_tx: rtrb::Producer<CapturedChunk>,
-    pub playout_rx: rtrb::Consumer<PcmBlock>,
 }
 
 impl Session {
@@ -104,7 +96,6 @@ impl Session {
         let sink_proxy_id = pw::proxy::ProxyT::upcast_ref(&sink).id();
         let AudioIo {
             capture_tx,
-            playout_rx,
             shared,
             events,
         } = io;
@@ -122,12 +113,8 @@ impl Session {
             failed: false,
             events,
             shared,
-            ends: Some(MediaEnds {
-                capture_tx,
-                playout_rx,
-            }),
+            capture_tx: Some(capture_tx),
             capture: None,
-            playback: None,
         }
     }
 
@@ -310,19 +297,16 @@ impl Session {
         }
     }
 
-    /// The ring ends for the streams; `None` once taken.
-    pub fn take_ends(&mut self) -> Option<MediaEnds> {
-        self.ends.take()
+    /// The capture ring's end for the capture stream; `None` once taken.
+    pub fn take_capture_tx(&mut self) -> Option<rtrb::Producer<CapturedChunk>> {
+        self.capture_tx.take()
     }
 
-    /// Drops the stream with `id` if it is one of this session's, and says what it was.
+    /// Drops the stream with `id` if it is this session's capture, and says what it was.
     pub fn remove_stream(&mut self, id: u64) -> Option<&'static str> {
         if self.capture.as_ref().is_some_and(|s| s.id == id) {
             drop(self.capture.take());
             Some("Audio capture")
-        } else if self.playback.as_ref().is_some_and(|s| s.id == id) {
-            drop(self.playback.take());
-            Some("The local copy")
         } else {
             None
         }
@@ -341,8 +325,7 @@ impl Drop for Session {
         self.answer_start(Err(AudioError::Backend(
             "Audio routing stopped before the sink was ready".to_string(),
         )));
-        // The streams go first, so the capture never sees its target vanish.
-        drop(self.playback.take());
+        // The capture goes first, so it never sees its target vanish.
         drop(self.capture.take());
         // A non-lingering adapter node lives as long as the resource bound to its proxy, so
         // destroying the proxy destroys the sink on the server.

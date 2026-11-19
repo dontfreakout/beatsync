@@ -98,6 +98,11 @@ impl NtpEstimator {
         Some(self.window.iter().map(|m| m.rtt_ms).sum::<f64>() / self.window.len() as f64)
     }
 
+    /// Accepted measurements in the window (0..=`MAX_MEASUREMENTS`).
+    pub fn measurements(&self) -> usize {
+        self.seen.min(MAX_MEASUREMENTS)
+    }
+
     pub fn is_synced(&self) -> bool {
         self.seen >= MAX_MEASUREMENTS
     }

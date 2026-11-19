@@ -22,7 +22,7 @@ export const ServerActionEnum = z.enum([
 ]);
 
 // Client change
-export const ClientKindEnum = z.enum(["web", "streamer"]);
+export const ClientKindEnum = z.enum(["web", "streamer", "app"]);
 export type ClientKind = z.infer<typeof ClientKindEnum>;
 
 export const ClientDataSchema = z.object({
@@ -37,7 +37,7 @@ export const ClientDataSchema = z.object({
   lastLivenessPingAt: z.number().default(0), // When the server last sent a LIVENESS_PING (server-managed)
   isAdmin: z.boolean().default(false), // Admin status
   isCreator: z.boolean().default(false), // Site creator badge
-  kind: ClientKindEnum.default("web"), // Native streamer apps join as "streamer"
+  kind: ClientKindEnum.catch("web"), // Native streamer CLI joins as "streamer", the desktop app as "app"; unknown or missing is "web"
   location: LocationSchema.optional(),
   joinedAt: z.number(), // Timestamp when the client joined the room
 });

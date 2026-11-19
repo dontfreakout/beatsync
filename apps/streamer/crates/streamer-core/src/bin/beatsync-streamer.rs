@@ -15,7 +15,7 @@ use tokio::signal::unix::{SignalKind, signal};
 
 use streamer_core::audio::{AppInfo, AudioBackend, AudioError};
 use streamer_core::config::{self, Settings};
-use streamer_core::connection::build_ws_url;
+use streamer_core::connection::{JoinKind, build_ws_url};
 use streamer_core::engine::{Phase, Status};
 use streamer_core::runtime::StreamerHandle;
 
@@ -41,7 +41,7 @@ struct Args {
     /// Room delay in ms (250..5000)
     #[arg(long, value_name = "MS")]
     delay: Option<u32>,
-    /// Shifts the local copy on this machine, in ms
+    /// Shifts the local copy on this machine, in ms; negative = earlier
     #[arg(long, value_name = "MS", allow_negative_numbers = true)]
     local_offset: Option<f64>,
     /// Lists the apps that play audio now and exits
@@ -108,7 +108,8 @@ fn apply(args: &Args, settings: &mut Settings) {
         settings.delay_ms = delay;
     }
     if let Some(offset) = args.local_offset {
-        settings.local_offset_ms = offset;
+        // The flag keeps its meaning (positive = later); the nudge is the opposite.
+        settings.nudge_ms = -offset;
     }
     settings.normalize();
 }
@@ -128,6 +129,7 @@ fn check_ready(settings: &Settings) -> Result<(), String> {
         &settings.room_id,
         &settings.username,
         &settings.client_id,
+        JoinKind::Streamer,
     )
     .map(|_| ())
     .map_err(|e| e.to_string())
@@ -199,7 +201,7 @@ async fn stream(settings: Settings, backend: Arc<dyn AudioBackend>) -> ExitCode 
     // Started only after the first sync: before it, the worker drops the captured audio, so
     // the routed apps would be silent, and stay silent while the server does not answer.
     let mut pending_start = Some((settings.selected_apps.clone(), settings.delay_ms));
-    let handle = StreamerHandle::connect(settings, backend).await;
+    let handle = StreamerHandle::connect(settings, backend, JoinKind::Streamer, None).await;
     let mut status = handle.status();
 
     let (line, synced_once) = {
@@ -282,4 +284,17 @@ fn status_line(s: &Status) -> String {
         let _ = write!(line, " message=\"{message}\"");
     }
     line
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_offset_flag_sets_the_opposite_nudge() {
+        let args = Args::parse_from(["beatsync-streamer", "--local-offset", "40"]);
+        let mut settings = Settings::default();
+        apply(&args, &mut settings);
+        assert_eq!(settings.nudge_ms, -40.0);
+    }
 }

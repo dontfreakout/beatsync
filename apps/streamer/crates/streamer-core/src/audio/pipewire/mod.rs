@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use ::pipewire as pw;
 
-use super::{AppInfo, AudioBackend, AudioError, AudioIo};
+use super::{AppInfo, AudioBackend, AudioError, AudioIo, OutputIo};
 
 mod capture;
 mod media;
@@ -37,8 +37,8 @@ const RESTORE_RACE: Duration = Duration::from_secs(1);
 const REPLY_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// The PipeWire backend. All PipeWire objects live on its own thread; the methods block until
-/// that thread answers. Dropping it stops routing (if started), removes the sink and ends the
-/// thread.
+/// that thread answers. Dropping it stops routing (if started), removes the sink, closes the
+/// output and ends the thread.
 pub struct PipeWireBackend {
     commands: pw::channel::Sender<Request>,
     thread: Option<JoinHandle<()>>,
@@ -103,6 +103,18 @@ impl AudioBackend for PipeWireBackend {
     fn stop(&self) -> Result<(), AudioError> {
         self.call(Command::Stop)
     }
+
+    fn open_output(&self, io: OutputIo) -> Result<(), AudioError> {
+        self.call(|reply| Command::OpenOutput {
+            io,
+            target: None,
+            reply,
+        })
+    }
+
+    fn close_output(&self) -> Result<(), AudioError> {
+        self.call(Command::CloseOutput)
+    }
 }
 
 impl Drop for PipeWireBackend {
@@ -128,12 +140,13 @@ mod tests {
     //!
     //! They need PipeWire 1.0+, WirePlumber 0.5+ and `pw-cat`, `pw-dump`, `pw-link`,
     //! `pw-metadata`, `pw-cli`. They touch only what they create: their own sinks, the
-    //! streamer's capture and local-copy streams (the local copy on the default output plays
-    //! silence: its ring stays empty and its gain is 0), and `pw-cat` streams that play
-    //! silence from `/dev/zero`. Other streams and the default devices stay as they are. The
-    //! tests run one at a time (`LOCK`), and every child process is killed on exit, also when
-    //! a test fails.
+    //! streamer's capture and output streams (the output plays silence to a test sink of its
+    //! own: its rings stay empty, its gain is 0 and the metronome is off), and `pw-cat`
+    //! streams that play silence from `/dev/zero`. Other streams and the default devices stay
+    //! as they are. The tests run one at a time (`LOCK`), and every child process is killed on
+    //! exit, also when a test fails.
 
+    use std::collections::BTreeMap;
     use std::process::{Child, Command as Process, Stdio};
     use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -141,9 +154,10 @@ mod tests {
     use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
     use super::capture::CAPTURE_NAME;
-    use super::playback::PLAYBACK_NAME;
+    use super::playback::{NO_LOCAL_OUTPUT, PLAYBACK_NAME};
     use super::*;
     use crate::audio::{AudioEvent, PlayoutShared};
+    use crate::dsp::Metronome;
 
     static LOCK: Mutex<()> = Mutex::new(());
     /// Set for the child process of `sink_disappears_when_the_owning_connection_closes`.
@@ -155,15 +169,63 @@ mod tests {
 
     fn test_io() -> (AudioIo, UnboundedReceiver<AudioEvent>) {
         let (capture_tx, _) = rtrb::RingBuffer::new(4);
-        let (_, playout_rx) = rtrb::RingBuffer::new(4);
         let (events, events_rx) = unbounded_channel();
         let io = AudioIo {
             capture_tx,
-            playout_rx,
             shared: Arc::new(PlayoutShared::default()),
             events,
         };
         (io, events_rx)
+    }
+
+    /// The ends of a silent output: empty rings, gain 0, no metronome.
+    fn test_output() -> (OutputIo, UnboundedReceiver<AudioEvent>) {
+        let (_, stream_rx) = rtrb::RingBuffer::new(4);
+        let (_, track_rx) = rtrb::RingBuffer::new(4);
+        let (events, events_rx) = unbounded_channel();
+        let io = OutputIo {
+            stream_rx,
+            track_rx,
+            metronome: Metronome::kick().expect("kick"),
+            lowpass: true,
+            shared: Arc::new(PlayoutShared::default()),
+            events,
+        };
+        (io, events_rx)
+    }
+
+    /// Creates a null sink on the backend's connection, so it goes away with the backend,
+    /// and returns its name once it is in the registry.
+    fn test_sink(backend: &PipeWireBackend) -> String {
+        let name = format!("beatsync-test-{}-out", std::process::id());
+        let created = backend.call(|reply| Command::CreateSink {
+            name: name.clone(),
+            reply,
+        });
+        created.expect("test sink");
+        assert!(
+            wait_until(Duration::from_secs(3), || node_id(&name).is_some()),
+            "the test sink appears"
+        );
+        name
+    }
+
+    /// Opens a silent output pinned to `sink`, never to a real device, and waits until it
+    /// plays there.
+    fn open_test_output(backend: &PipeWireBackend, sink: &str) -> UnboundedReceiver<AudioEvent> {
+        let (io, events) = test_output();
+        let opened = backend.call(|reply| Command::OpenOutput {
+            io,
+            target: Some(sink.to_string()),
+            reply,
+        });
+        opened.expect("open_output");
+        assert!(
+            wait_until(Duration::from_secs(3), || output_only_to(sink)),
+            "the output plays to the test sink only: {:?}",
+            own_links(PLAYBACK_NAME)
+        );
+        events
     }
 
     /// Kills and reaps the child when dropped.
@@ -722,10 +784,45 @@ mod tests {
         backend.stop().expect("stop");
     }
 
+    fn dump_objects() -> Vec<Value> {
+        let dump: Value = serde_json::from_str(&output("pw-dump", &[])).expect("pw-dump JSON");
+        dump.as_array().cloned().unwrap_or_default()
+    }
+
     /// Ids of this process's nodes named `name`.
     fn own_nodes(name: &str) -> Vec<u32> {
-        let dump: Value = serde_json::from_str(&output("pw-dump", &[])).expect("pw-dump JSON");
-        let objects = dump.as_array().cloned().unwrap_or_default();
+        own_nodes_in(&dump_objects(), name)
+    }
+
+    /// `node.name`s of the nodes that this process's nodes named `name` link to, one per
+    /// link. Same-named nodes of other processes (a running streamer) do not count.
+    pub(super) fn own_links(name: &str) -> Vec<String> {
+        let objects = dump_objects();
+        let own = own_nodes_in(&objects, name);
+        let names: BTreeMap<u64, &str> = objects
+            .iter()
+            .filter(|o| o["type"] == "PipeWire:Interface:Node")
+            .filter_map(|o| Some((o["id"].as_u64()?, o["info"]["props"]["node.name"].as_str()?)))
+            .collect();
+        objects
+            .iter()
+            .filter(|o| o["type"] == "PipeWire:Interface:Link")
+            .filter(|o| {
+                let from = o["info"]["output-node-id"].as_u64();
+                from.is_some_and(|id| own.iter().any(|own| u64::from(*own) == id))
+            })
+            .filter_map(|o| names.get(&o["info"]["input-node-id"].as_u64()?))
+            .map(|name| name.to_string())
+            .collect()
+    }
+
+    /// Whether this process's output is linked, and only to `sink`.
+    fn output_only_to(sink: &str) -> bool {
+        let links = own_links(PLAYBACK_NAME);
+        !links.is_empty() && links.iter().all(|n| n == sink)
+    }
+
+    fn own_nodes_in(objects: &[Value], name: &str) -> Vec<u32> {
         let pid = u64::from(std::process::id());
         // Stream nodes carry the process id only on their client.
         let clients: Vec<u64> = objects
@@ -748,9 +845,11 @@ mod tests {
 
     #[test]
     #[ignore = "needs a live PipeWire session"]
-    fn start_captures_the_sink_and_plays_the_local_copy() {
+    fn start_captures_the_sink_while_the_output_plays() {
         let _lock = lock();
         let backend = PipeWireBackend::new().expect("backend");
+        let out_sink = test_sink(&backend);
+        let mut output_events = open_test_output(&backend, &out_sink);
         let (io, mut events) = test_io();
         backend.start(Vec::new(), io).expect("start");
         let sink = sinks_of(std::process::id()).pop().expect("sink");
@@ -762,30 +861,212 @@ mod tests {
             "the capture reads the sink's monitor: {:?}",
             links_from(&sink)
         );
-        // The test's local copy is silent: its ring stays empty and its gain is 0.
-        let default = default_sink_name();
         assert!(
-            wait_until(Duration::from_secs(3), || linked_only_to(
-                PLAYBACK_NAME,
-                &default
-            )),
-            "the local copy plays to the default output: {:?}",
-            links_from(PLAYBACK_NAME)
+            output_only_to(&out_sink),
+            "the output plays on, never into the sink: {:?}",
+            own_links(PLAYBACK_NAME)
         );
         assert_eq!(own_nodes(CAPTURE_NAME).len(), 1, "one capture stream");
-        assert_eq!(own_nodes(PLAYBACK_NAME).len(), 1, "one local copy");
+        assert_eq!(own_nodes(PLAYBACK_NAME).len(), 1, "one output");
         backend.stop().expect("stop");
         assert_eq!(
             own_nodes(CAPTURE_NAME),
             Vec::<u32>::new(),
             "capture removed"
         );
-        assert_eq!(
-            own_nodes(PLAYBACK_NAME),
-            Vec::<u32>::new(),
-            "local copy removed"
+        assert_eq!(own_nodes(PLAYBACK_NAME).len(), 1, "the output stays");
+        backend.close_output().expect("close_output");
+        assert!(
+            wait_until(Duration::from_secs(2), || own_nodes(PLAYBACK_NAME)
+                .is_empty()),
+            "the output is removed"
         );
         assert!(events.try_recv().is_err(), "no failure reported");
+        assert!(output_events.try_recv().is_err(), "no output failure");
+    }
+
+    /// Makes the backend take one of its own sinks as the default output, as when the user
+    /// picks the Beatsync sink or the last real device goes away. Only the backend's view
+    /// changes: the real default output stays as it is.
+    fn fake_own_default(backend: &PipeWireBackend) {
+        let value = format!(r#"{{"name":"beatsync-{}-999"}}"#, std::process::id());
+        let faked = backend.call(|reply| Command::FakeDefaultSink { value, reply });
+        faked.expect("fake default");
+    }
+
+    /// The next failure the session reports within 3 s.
+    fn next_failure(events: &mut UnboundedReceiver<AudioEvent>) -> Option<String> {
+        let mut failure = None;
+        wait_until(Duration::from_secs(3), || {
+            if let Ok(AudioEvent::Failed(m)) = events.try_recv() {
+                failure = Some(m);
+            }
+            failure.is_some()
+        });
+        failure
+    }
+
+    /// Stops `backend` and checks that `app` (stream `id`) is back on `default` with no
+    /// routing entry, and that the sink is gone.
+    fn stop_restores(backend: &PipeWireBackend, app: &str, id: u32, default: &str) {
+        backend.stop().expect("stop");
+        assert!(
+            wait_until(Duration::from_secs(3), || linked_only_to(app, default)),
+            "back on the default sink: {:?}",
+            links_from(app)
+        );
+        assert_eq!(metadata_line(id, "target.object"), None);
+        let pid = std::process::id();
+        assert!(
+            wait_until(Duration::from_secs(2), || sinks_of(pid).is_empty()),
+            "the sink is removed"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs a live PipeWire session"]
+    fn a_start_with_our_sink_as_the_default_captures_nothing() {
+        // The output follows the default output. With our sink as the default, a capture of
+        // it would record the PC's own output and send it to the room.
+        let _lock = lock();
+        let app = format!("beatsync-test-{}", std::process::id());
+        let _tone = play_silence(&app);
+        let backend = PipeWireBackend::new().expect("backend");
+        wait_listed(&backend, &app);
+        let id = node_id(&app).expect("stream node");
+        let default = default_sink_name();
+        let out_sink = test_sink(&backend);
+        let mut output_events = open_test_output(&backend, &out_sink);
+        fake_own_default(&backend);
+
+        let (io, mut events) = test_io();
+        backend.start(vec![app.clone()], io).expect("start");
+        assert_eq!(next_failure(&mut events).as_deref(), Some(NO_LOCAL_OUTPUT));
+        let sink = sinks_of(std::process::id()).pop().expect("sink");
+        assert!(
+            wait_until(Duration::from_secs(3), || linked_only_to(&app, &sink)),
+            "the app was routed before the check: {:?}",
+            links_from(&app)
+        );
+        // A capture made anyway would show up by now.
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(own_nodes(CAPTURE_NAME), Vec::<u32>::new(), "no capture");
+
+        stop_restores(&backend, &app, id, &default);
+        assert_eq!(own_nodes(PLAYBACK_NAME).len(), 1, "the output stays");
+        assert!(output_events.try_recv().is_err(), "no output failure");
+        assert!(events.try_recv().is_err(), "one failure only");
+        backend.close_output().expect("close_output");
+    }
+
+    #[test]
+    #[ignore = "needs a live PipeWire session"]
+    fn our_sink_as_the_new_default_stops_the_capture_at_once() {
+        // The default output changes to our sink while streaming, and the output follows it.
+        // The capture must stop now, not when the engine has heard of it and stops the stream.
+        let _lock = lock();
+        let app = format!("beatsync-test-{}", std::process::id());
+        let _tone = play_silence(&app);
+        let backend = PipeWireBackend::new().expect("backend");
+        wait_listed(&backend, &app);
+        let id = node_id(&app).expect("stream node");
+        let default = default_sink_name();
+        let out_sink = test_sink(&backend);
+        let mut output_events = open_test_output(&backend, &out_sink);
+        let (io, mut events) = test_io();
+        backend.start(vec![app.clone()], io).expect("start");
+        let sink = sinks_of(std::process::id()).pop().expect("sink");
+        assert!(
+            wait_until(Duration::from_secs(3), || {
+                linked_only_to(&app, &sink) && own_nodes(CAPTURE_NAME).len() == 1
+            }),
+            "routed and captured: {:?}",
+            links_from(&app)
+        );
+
+        fake_own_default(&backend);
+        assert_eq!(next_failure(&mut events).as_deref(), Some(NO_LOCAL_OUTPUT));
+        assert!(
+            wait_until(Duration::from_secs(1), || own_nodes(CAPTURE_NAME)
+                .is_empty()),
+            "the capture stops before the stream stops"
+        );
+        // The late state of the dropped capture is no second failure.
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(events.try_recv().is_err(), "one failure only");
+        assert_eq!(own_nodes(PLAYBACK_NAME).len(), 1, "the output stays");
+
+        stop_restores(&backend, &app, id, &default);
+        assert!(output_events.try_recv().is_err(), "no output failure");
+        backend.close_output().expect("close_output");
+    }
+
+    #[test]
+    #[ignore = "needs a live PipeWire session"]
+    fn the_output_survives_stream_start_and_stop() {
+        // The queue track plays through the output while streams start and stop.
+        let _lock = lock();
+        let backend = PipeWireBackend::new().expect("backend");
+        let out_sink = test_sink(&backend);
+        let mut output_events = open_test_output(&backend, &out_sink);
+        let before = own_nodes(PLAYBACK_NAME);
+        assert_eq!(before.len(), 1, "one output");
+        for round in 0..2 {
+            let (io, mut events) = test_io();
+            backend.start(Vec::new(), io).expect("start");
+            assert!(
+                wait_until(Duration::from_secs(3), || own_nodes(CAPTURE_NAME).len()
+                    == 1),
+                "round {round}: the capture runs"
+            );
+            assert_eq!(own_nodes(PLAYBACK_NAME), before, "round {round}: streaming");
+            backend.stop().expect("stop");
+            assert_eq!(own_nodes(PLAYBACK_NAME), before, "round {round}: stopped");
+            assert!(events.try_recv().is_err(), "round {round}: no failure");
+        }
+        assert!(output_only_to(&out_sink), "{:?}", own_links(PLAYBACK_NAME));
+        assert!(output_events.try_recv().is_err(), "no output failure");
+        backend.close_output().expect("close_output");
+        assert!(
+            wait_until(Duration::from_secs(2), || own_nodes(PLAYBACK_NAME)
+                .is_empty()),
+            "the output is removed"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs a live PipeWire session"]
+    fn a_failed_output_leaves_the_session_running() {
+        // A lost output must not stop the stream the room hears.
+        let _lock = lock();
+        let backend = PipeWireBackend::new().expect("backend");
+        let out_sink = test_sink(&backend);
+        let mut output_events = open_test_output(&backend, &out_sink);
+        let (io, mut events) = test_io();
+        backend.start(Vec::new(), io).expect("start");
+        assert!(
+            wait_until(Duration::from_secs(3), || own_nodes(CAPTURE_NAME).len()
+                == 1),
+            "the capture runs"
+        );
+        let id = own_nodes(PLAYBACK_NAME)[0].to_string();
+        output("pw-cli", &["destroy", &id]);
+        let mut message = None;
+        wait_until(Duration::from_secs(3), || {
+            if let Ok(AudioEvent::OutputFailed(m)) = output_events.try_recv() {
+                message = Some(m);
+            }
+            message.is_some()
+        });
+        let message = message.expect("the runtime hears that the output stopped");
+        println!("output failure: {message}");
+        assert!(own_nodes(PLAYBACK_NAME).is_empty(), "the output is closed");
+        // A wrongly failed session would report within this time.
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(events.try_recv().is_err(), "the session goes on");
+        assert_eq!(own_nodes(CAPTURE_NAME).len(), 1, "the capture goes on");
+        backend.stop().expect("stop");
+        backend.close_output().expect("close_output with no output");
     }
 
     #[test]

@@ -3,6 +3,7 @@
 use crate::clock::epoch_ms;
 use crate::ntp::PROBE_GAP_MS;
 use crate::protocol::{ClientMessage, ServerMessage};
+use crate::room;
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Once;
 use std::time::Duration;
@@ -33,9 +34,14 @@ impl std::error::Error for ConnError {}
 pub enum Outgoing {
     Json(ClientMessage),
     Binary(Vec<u8>),
+    /// A room action of the window, sent as it is.
+    Action(serde_json::Value),
     ProbePair {
         group_id: u64,
         client_rtt: Option<f64>,
+        client_nudge_ms: f64,
+        /// `clientCompensationMs` of both requests ([`client_compensation_ms`]).
+        client_compensation_ms: Option<f64>,
     },
 }
 
@@ -43,6 +49,12 @@ pub enum Outgoing {
 pub enum ConnEvent {
     Connected,
     Disconnected,
+    /// A connect attempt failed; the reason, e.g. "IO error: Connection refused (os error
+    /// 111)". The next attempt follows after the backoff.
+    ConnectFailed(String),
+    /// A server message for the window ([`room::forwarded`]), raw. It is followed by the
+    /// parsed [`ConnEvent::Message`] of the same text when the core can parse it.
+    Room(serde_json::Value),
     Message(ServerMessage),
     NtpResponse {
         t0: f64,
@@ -54,11 +66,28 @@ pub enum ConnEvent {
     },
 }
 
+/// The client kind this process announces to the server when it joins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinKind {
+    Streamer,
+    App,
+}
+
+impl JoinKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Streamer => "streamer",
+            Self::App => "app",
+        }
+    }
+}
+
 pub fn build_ws_url(
     server: &str,
     room: &str,
     username: &str,
     client_id: &str,
+    kind: JoinKind,
 ) -> Result<String, ConnError> {
     let mut url = url::Url::parse(server).map_err(|e| ConnError::InvalidUrl(e.to_string()))?;
     match url.scheme() {
@@ -76,7 +105,7 @@ pub fn build_ws_url(
         .append_pair("roomId", room)
         .append_pair("username", username)
         .append_pair("clientId", client_id)
-        .append_pair("kind", "streamer");
+        .append_pair("kind", kind.as_str());
     Ok(url.into())
 }
 
@@ -90,7 +119,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 const BACKOFF_SECS: [u64; 5] = [1, 2, 4, 8, 10];
 
-fn install_crypto_provider() {
+pub(crate) fn install_crypto_provider() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -115,19 +144,46 @@ enum SessionEnd {
     Stop,
 }
 
+/// The second request of a probe pair, due at `deadline`.
 struct PendingProbe {
     deadline: Instant,
-    group_id: u64,
-    client_rtt: Option<f64>,
+    probe: Probe,
 }
 
-fn probe_message(group_id: u64, client_rtt: Option<f64>, index: u8) -> Message {
+/// What both requests of a probe pair carry besides the send time.
+#[derive(Clone, Copy)]
+struct Probe {
+    group_id: u64,
+    client_rtt: Option<f64>,
+    client_nudge_ms: f64,
+    client_compensation_ms: Option<f64>,
+}
+
+/// The local compensation an app reports in its NTP requests: how far ahead its output
+/// renders (the output latency; a value not measured counts as 0) plus its nudge, when that
+/// is above 0, as the web client reports it. The server schedules a `PLAY` or `PAUSE` at
+/// least that far ahead. The CLI reports none: it plays no queue track.
+pub fn client_compensation_ms(kind: JoinKind, render_ahead_ms: f64, nudge_ms: f64) -> Option<f64> {
+    if kind != JoinKind::App {
+        return None;
+    }
+    let output_latency_ms = if render_ahead_ms.is_finite() {
+        render_ahead_ms.max(0.0)
+    } else {
+        0.0
+    };
+    let compensation_ms = output_latency_ms + nudge_ms;
+    // NaN is not above 0 either.
+    (compensation_ms > 0.0).then_some(compensation_ms)
+}
+
+fn probe_message(probe: Probe, index: u8) -> Message {
     let msg = ClientMessage::NtpRequest {
         t0: epoch_ms(),
-        client_rtt,
-        client_compensation_ms: None,
-        client_nudge_ms: None,
-        probe_group_id: group_id,
+        client_rtt: probe.client_rtt,
+        client_compensation_ms: probe.client_compensation_ms,
+        client_nudge_ms: Some(probe.client_nudge_ms),
+        probe_group_id: probe.group_id,
         probe_group_index: index,
     };
     json_message(&msg)
@@ -136,6 +192,44 @@ fn probe_message(group_id: u64, client_rtt: Option<f64>, index: u8) -> Message {
 fn json_message(msg: &ClientMessage) -> Message {
     // Serialization of these plain types cannot fail.
     Message::text(serde_json::to_string(msg).unwrap_or_default())
+}
+
+/// Sends the events of one text message from the server, received at `t3`: the raw message
+/// for the window first (when [`room::forwarded`]), then the parsed one for the engine. A
+/// message that does not parse is logged and dropped. False when the receiver is gone.
+fn send_text_events(text: &str, t3: f64, ev_tx: &mpsc::UnboundedSender<ConnEvent>) -> bool {
+    let value: serde_json::Value = match serde_json::from_str(text) {
+        Ok(value) => value,
+        Err(e) => {
+            eprintln!("streamer: cannot parse server message: {e}");
+            return true;
+        }
+    };
+    if room::forwarded(&value) && ev_tx.send(ConnEvent::Room(value.clone())).is_err() {
+        return false;
+    }
+    let event = match serde_json::from_value::<ServerMessage>(value) {
+        Ok(ServerMessage::NtpResponse {
+            t0,
+            t1,
+            t2,
+            probe_group_id,
+            probe_group_index,
+        }) => ConnEvent::NtpResponse {
+            t0,
+            t1,
+            t2,
+            t3,
+            group_id: probe_group_id,
+            index: probe_group_index,
+        },
+        Ok(message) => ConnEvent::Message(message),
+        Err(e) => {
+            eprintln!("streamer: cannot parse server message: {e}");
+            return true;
+        }
+    };
+    ev_tx.send(event).is_ok()
 }
 
 async fn session(
@@ -170,22 +264,33 @@ async fn session(
             }
             _ = probe_wait => {
                 if let Some(p) = pending.take() {
-                    to_send.push(probe_message(p.group_id, p.client_rtt, 1));
+                    to_send.push(probe_message(p.probe, 1));
                 }
             }
             out = out_rx.recv() => match out {
                 None => return SessionEnd::Stop,
                 Some(Outgoing::Json(m)) => to_send.push(json_message(&m)),
                 Some(Outgoing::Binary(b)) => to_send.push(Message::binary(b)),
-                Some(Outgoing::ProbePair { group_id, client_rtt }) => {
+                Some(Outgoing::Action(action)) => to_send.push(Message::text(action.to_string())),
+                Some(Outgoing::ProbePair {
+                    group_id,
+                    client_rtt,
+                    client_nudge_ms,
+                    client_compensation_ms,
+                }) => {
                     if let Some(p) = pending.take() {
-                        to_send.push(probe_message(p.group_id, p.client_rtt, 1));
+                        to_send.push(probe_message(p.probe, 1));
                     }
-                    to_send.push(probe_message(group_id, client_rtt, 0));
-                    pending = Some(PendingProbe {
-                        deadline: Instant::now() + Duration::from_millis(PROBE_GAP_MS as u64),
+                    let probe = Probe {
                         group_id,
                         client_rtt,
+                        client_nudge_ms,
+                        client_compensation_ms,
+                    };
+                    to_send.push(probe_message(probe, 0));
+                    pending = Some(PendingProbe {
+                        deadline: Instant::now() + Duration::from_millis(PROBE_GAP_MS as u64),
+                        probe,
                     });
                 }
             },
@@ -195,24 +300,8 @@ async fn session(
                 }
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
-                        let t3 = epoch_ms();
-                        match serde_json::from_str::<ServerMessage>(text.as_str()) {
-                            Ok(ServerMessage::NtpResponse { t0, t1, t2, probe_group_id, probe_group_index }) => {
-                                let ev = ConnEvent::NtpResponse {
-                                    t0, t1, t2, t3,
-                                    group_id: probe_group_id,
-                                    index: probe_group_index,
-                                };
-                                if ev_tx.send(ev).is_err() {
-                                    return SessionEnd::Stop;
-                                }
-                            }
-                            Ok(m) => {
-                                if ev_tx.send(ConnEvent::Message(m)).is_err() {
-                                    return SessionEnd::Stop;
-                                }
-                            }
-                            Err(e) => eprintln!("streamer: cannot parse server message: {e}"),
+                        if !send_text_events(text.as_str(), epoch_ms(), ev_tx) {
+                            return SessionEnd::Stop;
                         }
                     }
                     Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return SessionEnd::Lost,
@@ -276,11 +365,19 @@ pub async fn run_connection(
                     }
                 }
             }
-            Ok(Err(e)) => eprintln!("streamer: connect failed: {e}"),
-            Err(_) => eprintln!(
-                "streamer: connect timed out after {} s",
-                CONNECT_TIMEOUT.as_secs()
-            ),
+            Ok(Err(e)) => {
+                eprintln!("streamer: connect failed: {e}");
+                if ev_tx.send(ConnEvent::ConnectFailed(e.to_string())).is_err() {
+                    return;
+                }
+            }
+            Err(_) => {
+                let error = format!("timed out after {} s", CONNECT_TIMEOUT.as_secs());
+                eprintln!("streamer: connect {error}");
+                if ev_tx.send(ConnEvent::ConnectFailed(error)).is_err() {
+                    return;
+                }
+            }
         }
         let delay = Duration::from_secs(BACKOFF_SECS[attempt.min(BACKOFF_SECS.len() - 1)]);
         attempt += 1;
@@ -300,6 +397,7 @@ pub async fn run_connection(
 mod tests {
     use super::*;
     use crate::clock::epoch_ms;
+    use crate::protocol::RoomEvent;
     use futures_util::{SinkExt, StreamExt};
     use std::time::{Duration, Instant};
     use tokio::net::TcpListener;
@@ -359,7 +457,14 @@ mod tests {
 
     #[test]
     fn url_has_params_and_kind_streamer() {
-        let u = build_ws_url("wss://example.com/ws?x=1", "123456", "a b&c", "id-1").unwrap();
+        let u = build_ws_url(
+            "wss://example.com/ws?x=1",
+            "123456",
+            "a b&c",
+            "id-1",
+            JoinKind::Streamer,
+        )
+        .unwrap();
         let parsed = url::Url::parse(&u).unwrap();
         let pairs: Vec<(String, String)> = parsed
             .query_pairs()
@@ -376,8 +481,8 @@ mod tests {
             ]
         );
         assert!(!u.contains("a b&c"));
-        assert!(build_ws_url("http://example.com/ws", "1", "u", "c").is_err());
-        assert!(build_ws_url("not a url", "1", "u", "c").is_err());
+        assert!(build_ws_url("http://example.com/ws", "1", "u", "c", JoinKind::Streamer).is_err());
+        assert!(build_ws_url("not a url", "1", "u", "c", JoinKind::Streamer).is_err());
     }
 
     #[test]
@@ -387,6 +492,7 @@ mod tests {
             "2",
             "u",
             "c",
+            JoinKind::Streamer,
         )
         .unwrap();
         let pairs: Vec<(String, String)> = url::Url::parse(&u)
@@ -398,6 +504,20 @@ mod tests {
         assert_eq!(keys, ["x", "roomId", "username", "clientId", "kind"]);
         assert_eq!(pairs[1].1, "2");
         assert_eq!(pairs[4].1, "streamer");
+    }
+
+    #[test]
+    fn url_has_exactly_one_kind_pair_for_each_join_kind() {
+        for (kind, want) in [(JoinKind::App, "app"), (JoinKind::Streamer, "streamer")] {
+            let u = build_ws_url("ws://h/ws?kind=web", "123456", "Ann", "id", kind).unwrap();
+            let kinds: Vec<String> = url::Url::parse(&u)
+                .unwrap()
+                .query_pairs()
+                .filter(|(k, _)| k == "kind")
+                .map(|(_, v)| v.into_owned())
+                .collect();
+            assert_eq!(kinds, [want]);
+        }
     }
 
     #[tokio::test]
@@ -482,21 +602,24 @@ mod tests {
             .unwrap();
     }
 
-    #[tokio::test]
-    async fn probe_pair_is_two_requests_about_25_ms_apart() {
-        let mut h = harness().await;
-        let mut ws = accept(&h.listener).await;
-        assert!(matches!(next_ev(&mut h).await, ConnEvent::Connected));
+    /// The two NTP requests of one probe pair, with the time each arrived.
+    async fn probe_pair(
+        h: &Harness,
+        ws: &mut Ws,
+        client_compensation_ms: Option<f64>,
+    ) -> Vec<(Instant, serde_json::Value)> {
         h.out_tx
             .send(Outgoing::ProbePair {
                 group_id: 7,
                 client_rtt: Some(12.5),
+                client_nudge_ms: 7.5,
+                client_compensation_ms,
             })
             .await
             .unwrap();
         let mut got = Vec::new();
         for _ in 0..2 {
-            let m = next_msg(&mut ws).await;
+            let m = next_msg(ws).await;
             let at = Instant::now();
             let Message::Text(t) = m else {
                 panic!("not text")
@@ -504,6 +627,15 @@ mod tests {
             let v: serde_json::Value = serde_json::from_str(t.as_str()).unwrap();
             got.push((at, v));
         }
+        got
+    }
+
+    #[tokio::test]
+    async fn probe_pair_is_two_requests_about_25_ms_apart() {
+        let mut h = harness().await;
+        let mut ws = accept(&h.listener).await;
+        assert!(matches!(next_ev(&mut h).await, ConnEvent::Connected));
+        let got = probe_pair(&h, &mut ws, None).await;
         assert_eq!(got[0].1["type"], "NTP_REQUEST");
         assert_eq!(got[0].1["probeGroupIndex"], 0);
         assert_eq!(got[1].1["probeGroupIndex"], 1);
@@ -511,10 +643,36 @@ mod tests {
         assert_eq!(got[1].1["probeGroupId"], 7);
         assert_eq!(got[0].1["clientRTT"], 12.5);
         assert_eq!(got[1].1["clientRTT"], 12.5);
+        assert_eq!(got[0].1["clientNudgeMs"], 7.5);
+        assert_eq!(got[1].1["clientNudgeMs"], 7.5);
         assert!(got[0].1.get("clientCompensationMs").is_none());
+        assert!(got[1].1.get("clientCompensationMs").is_none());
         let gap = got[1].0.duration_since(got[0].0).as_secs_f64() * 1000.0;
         assert!((20.0..40.0).contains(&gap), "gap {gap} ms");
+
+        // A compensation goes into both requests.
+        let got = probe_pair(&h, &mut ws, Some(52.25)).await;
+        assert_eq!(got[0].1["clientCompensationMs"], 52.25);
+        assert_eq!(got[1].1["clientCompensationMs"], 52.25);
         h.shutdown_tx.send(true).unwrap();
+    }
+
+    #[test]
+    fn only_the_app_reports_a_positive_compensation() {
+        // Like the web client: output latency plus nudge, sent only when above 0. The server
+        // schedules a PLAY far enough ahead for it. The CLI plays no queue track.
+        let app = |ahead, nudge| client_compensation_ms(JoinKind::App, ahead, nudge);
+        assert_eq!(app(42.5, 7.5), Some(50.0));
+        assert_eq!(app(0.0, 3.0), Some(3.0));
+        assert_eq!(app(40.0, -40.0), None);
+        assert_eq!(app(10.0, -50.0), None);
+        // A render-ahead the output has not measured counts as 0.
+        assert_eq!(app(f64::NAN, 5.0), Some(5.0));
+        assert_eq!(app(f64::INFINITY, 5.0), Some(5.0));
+        assert_eq!(app(20.0, f64::NAN), None);
+        let cli = |ahead, nudge| client_compensation_ms(JoinKind::Streamer, ahead, nudge);
+        assert_eq!(cli(42.5, 7.5), None);
+        assert_eq!(cli(0.0, 30.0), None);
     }
 
     #[tokio::test]
@@ -563,6 +721,64 @@ mod tests {
             next_ev(&mut h).await,
             ConnEvent::Message(ServerMessage::LivenessPing)
         ));
+        h.shutdown_tx.send(true).unwrap();
+    }
+
+    #[tokio::test]
+    async fn room_messages_reach_the_feed_and_the_engine() {
+        // The window gets the raw room message; the engine still needs its parsed copy (the
+        // client list, the stream state). Clock sync and liveness stay in the core.
+        let mut h = harness().await;
+        let mut ws = accept(&h.listener).await;
+        assert!(matches!(next_ev(&mut h).await, ConnEvent::Connected));
+        for text in [
+            r#"{"type":"ROOM_EVENT","event":{"type":"CLIENT_CHANGE","clients":[{"username":"a","clientId":"1","isAdmin":true,"joinedAt":1}]}}"#,
+            r#"{"type":"NTP_RESPONSE","t0":1.0,"t1":2.0,"t2":3.0,"probeGroupId":9,"probeGroupIndex":1}"#,
+            r#"{"type":"LIVENESS_PING"}"#,
+        ] {
+            ws.send(Message::text(text)).await.unwrap();
+        }
+        match next_ev(&mut h).await {
+            ConnEvent::Room(v) => {
+                assert_eq!(v["type"], "ROOM_EVENT");
+                assert_eq!(v["event"]["clients"][0]["clientId"], "1");
+            }
+            e => panic!("unexpected {e:?}"),
+        }
+        match next_ev(&mut h).await {
+            ConnEvent::Message(ServerMessage::RoomEvent {
+                event: RoomEvent::ClientChange { clients },
+            }) => assert_eq!(clients[0].client_id, "1"),
+            e => panic!("unexpected {e:?}"),
+        }
+        assert!(matches!(
+            next_ev(&mut h).await,
+            ConnEvent::NtpResponse { group_id: 9, .. }
+        ));
+        assert!(matches!(
+            next_ev(&mut h).await,
+            ConnEvent::Message(ServerMessage::LivenessPing)
+        ));
+        h.shutdown_tx.send(true).unwrap();
+    }
+
+    #[tokio::test]
+    async fn actions_go_out_as_json() {
+        let mut h = harness().await;
+        let mut ws = accept(&h.listener).await;
+        assert!(matches!(next_ev(&mut h).await, ConnEvent::Connected));
+        let action = serde_json::json!({ "type": "SEND_CHAT_MESSAGE", "text": "hi" });
+        h.out_tx
+            .send(Outgoing::Action(action.clone()))
+            .await
+            .unwrap();
+        match next_msg(&mut ws).await {
+            Message::Text(t) => {
+                let sent: serde_json::Value = serde_json::from_str(t.as_str()).unwrap();
+                assert_eq!(sent, action);
+            }
+            m => panic!("unexpected {m:?}"),
+        }
         h.shutdown_tx.send(true).unwrap();
     }
 }

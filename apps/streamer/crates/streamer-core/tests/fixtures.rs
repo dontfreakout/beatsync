@@ -1,7 +1,7 @@
 use serde_json::Value;
 use streamer_core::frame::{decode_frame, encode_frame};
 use streamer_core::protocol::{
-    ClientKind, ClientMessage, RejectReason, RoomEvent, ScheduledAction, ServerMessage,
+    AudioSource, ClientKind, ClientMessage, RejectReason, RoomEvent, ScheduledAction, ServerMessage,
 };
 
 const FRAME_VECTORS: &str = include_str!(concat!(
@@ -84,6 +84,12 @@ fn build_client_message(name: &str) -> ClientMessage {
             label: "Firefox".into(),
         },
         "stopLiveStream" => ClientMessage::StopLiveStream,
+        "sync" => ClientMessage::Sync,
+        "audioSourceLoaded" => ClientMessage::AudioSourceLoaded {
+            source: AudioSource {
+                url: "https://r2.example/room-123456/song.mp3".into(),
+            },
+        },
         other => panic!("unknown client fixture '{other}': add it to build_client_message"),
     }
 }
@@ -160,9 +166,10 @@ fn known_server_messages_parse() {
         ServerMessage::RoomEvent {
             event: RoomEvent::ClientChange { clients },
         } => {
-            assert_eq!(clients.len(), 2);
+            assert_eq!(clients.len(), 3);
             assert_eq!(clients[0].kind, ClientKind::Web);
             assert_eq!(clients[1].kind, ClientKind::Streamer);
+            assert_eq!(clients[2].kind, ClientKind::App);
         }
         other => panic!("unexpected {other:?}"),
     }
