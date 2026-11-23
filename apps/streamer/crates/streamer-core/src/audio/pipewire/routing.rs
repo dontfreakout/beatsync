@@ -19,6 +19,9 @@ use crate::audio::apps::{
 use crate::audio::{AudioError, AudioEvent, AudioIo, CapturedChunk, PlayoutShared};
 
 const TARGET_OBJECT: &str = "target.object";
+/// WirePlumber 0.4's stream-restore writes this entry (value: a node id) when it restores a
+/// stream to an output; WirePlumber 0.5 honours it too.
+const TARGET_NODE: &str = "target.node";
 
 /// `node.name` of the `n`-th sink of process `pid`.
 pub(super) fn sink_name(pid: u32, n: u32) -> String {
@@ -233,11 +236,13 @@ impl Session {
         metadata: &Metadata,
         nodes: &[StreamNode],
         targets: &mut BTreeMap<u32, MetaValue>,
+        node_targets: &mut BTreeMap<u32, String>,
         now: Instant,
     ) {
         let Some(serial) = self.sink_global.as_ref().map(|s| s.serial.clone()) else {
             return;
         };
+        let sink_node = self.sink_global.as_ref().map(|s| s.id.to_string());
         self.added
             .retain(|_, at| now.saturating_duration_since(*at) <= RESTORE_RACE);
         self.release_moved_away(targets, &serial, now);
@@ -270,6 +275,10 @@ impl Session {
                 RouteAction::Restore { node_id } => {
                     let previous = self.moved.remove(&node_id).flatten();
                     write_target(metadata, targets, node_id, previous);
+                    // A `target.node` entry to the sink would keep the stream there (K1).
+                    if node_targets.get(&node_id) == sink_node.as_ref() {
+                        clear_target_node(metadata, node_targets, node_id);
+                    }
                 }
             }
         }
@@ -277,11 +286,20 @@ impl Session {
 
     /// Gives every moved stream that still points at the sink its previous target back (or
     /// deletes the entry), and deletes every other entry that points at the sink. Streams the
-    /// user moved away keep the user's target.
+    /// user moved away keep the user's target. Also deletes every `target.node` entry that
+    /// points at the sink (C4); entries to other nodes stay, so a stream goes back to a
+    /// remembered output.
+    ///
+    /// Accepted WirePlumber 0.4 difference (K2): 0.4 saves the sink as the app's target when
+    /// it moves a stream, and clears that when the entry is deleted. So 0.4 forgets the app's
+    /// remembered output once the app was streamed. Its streams still go back to their output
+    /// at stop (the `target.node` entry to that output stays), but the next start of the app
+    /// uses the default output.
     pub fn restore_all(
         &mut self,
         metadata: &Metadata,
         targets: &mut BTreeMap<u32, MetaValue>,
+        node_targets: &mut BTreeMap<u32, String>,
         now: Instant,
     ) {
         if let Some(serial) = self.sink_global.as_ref().map(|s| s.serial.clone()) {
@@ -299,6 +317,16 @@ impl Session {
                 .collect();
             for node_id in to_sink {
                 write_target(metadata, targets, node_id, None);
+            }
+        }
+        if let Some(sink_node) = self.sink_global.as_ref().map(|s| s.id.to_string()) {
+            let to_sink: Vec<u32> = node_targets
+                .iter()
+                .filter(|(_, value)| **value == sink_node)
+                .map(|(id, _)| *id)
+                .collect();
+            for node_id in to_sink {
+                clear_target_node(metadata, node_targets, node_id);
             }
         }
     }
@@ -356,4 +384,10 @@ fn write_target(
             targets.remove(&node_id);
         }
     }
+}
+
+/// Deletes the `target.node` entry of `node_id` and records it.
+fn clear_target_node(metadata: &Metadata, node_targets: &mut BTreeMap<u32, String>, node_id: u32) {
+    metadata.set_property(node_id, TARGET_NODE, None, None);
+    node_targets.remove(&node_id);
 }

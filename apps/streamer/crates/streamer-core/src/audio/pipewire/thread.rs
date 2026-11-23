@@ -140,6 +140,9 @@ struct Inbox {
     streams_changed: bool,
     /// `target.object` entries of the `default` metadata by subject.
     targets: BTreeMap<u32, MetaValue>,
+    /// `target.node` entries of the `default` metadata by subject (WirePlumber 0.4's
+    /// stream-restore writes them; the value is a node id). Not part of `targets_changed`.
+    node_targets: BTreeMap<u32, String>,
     /// Raw seqs of `done` events for `core.sync`.
     done: Vec<i32>,
     errors: Vec<CoreError>,
@@ -602,16 +605,19 @@ impl Worker {
                         inbox.default_sink_changed = true;
                     }
                     let targets = &mut inbox.targets;
+                    let node_targets = &mut inbox.node_targets;
                     match (key, value) {
                         // `clear()` of the whole metadata, or of one subject.
                         (None, _) if subject == pw::constants::ID_ANY => {
                             targets.clear();
+                            node_targets.clear();
                             inbox.default_sink = None;
                             inbox.default_sink_changed = true;
                             inbox.targets_changed = true;
                         }
                         (None, _) => {
                             targets.remove(&subject);
+                            node_targets.remove(&subject);
                             inbox.targets_changed = true;
                         }
                         (Some("target.object"), Some(value)) => {
@@ -626,6 +632,12 @@ impl Worker {
                             targets.remove(&subject);
                             inbox.targets_changed = true;
                         }
+                        (Some("target.node"), Some(value)) => {
+                            node_targets.insert(subject, value.to_string());
+                        }
+                        (Some("target.node"), None) => {
+                            node_targets.remove(&subject);
+                        }
                         _ => {}
                     }
                     0
@@ -635,6 +647,7 @@ impl Worker {
         {
             let mut inbox = self.inbox.borrow_mut();
             inbox.targets.clear();
+            inbox.node_targets.clear();
             inbox.default_sink = None;
         }
         self.metadata = Some(DefaultMetadata {
@@ -683,7 +696,10 @@ impl Worker {
         self.wireplumber.remove(&id);
         if self.metadata.as_ref().is_some_and(|m| m.id == id) {
             self.metadata = None;
-            self.inbox.borrow_mut().targets.clear();
+            let mut inbox = self.inbox.borrow_mut();
+            inbox.targets.clear();
+            inbox.node_targets.clear();
+            drop(inbox);
             if let Some(session) = &mut self.session {
                 session.fail("The PipeWire session manager stopped");
             }
@@ -1053,7 +1069,14 @@ impl Worker {
         };
         if session.is_routing() {
             let mut inbox = self.inbox.borrow_mut();
-            session.route(&metadata.bound.proxy, &nodes, &mut inbox.targets, now);
+            let inbox = &mut *inbox;
+            session.route(
+                &metadata.bound.proxy,
+                &nodes,
+                &mut inbox.targets,
+                &mut inbox.node_targets,
+                now,
+            );
         }
     }
 
@@ -1073,7 +1096,13 @@ impl Worker {
             && let Some(metadata) = &self.metadata
         {
             let mut inbox = self.inbox.borrow_mut();
-            session.restore_all(&metadata.bound.proxy, &mut inbox.targets, now);
+            let inbox = &mut *inbox;
+            session.restore_all(
+                &metadata.bound.proxy,
+                &mut inbox.targets,
+                &mut inbox.node_targets,
+                now,
+            );
         }
         drop(session);
         let sync = if self.lost.is_none() {

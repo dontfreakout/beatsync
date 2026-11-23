@@ -349,6 +349,54 @@ mod tests {
             .map(str::to_string)
     }
 
+    /// Sets the `default` metadata entry `key` of subject `id` (`Spa:Id` type).
+    fn set_metadata(id: u32, key: &str, value: &str) {
+        let id = id.to_string();
+        output(
+            "pw-metadata",
+            &["-n", "default", "--", &id, key, value, "Spa:Id"],
+        );
+    }
+
+    /// The subjects of the `default` metadata entries with `key` and `value`.
+    fn subjects_with(key: &str, value: &str) -> Vec<u32> {
+        let needle = format!("key:'{key}' value:'{value}'");
+        output("pw-metadata", &["-n", "default"])
+            .lines()
+            .filter(|line| line.contains(&needle))
+            .filter_map(|line| line.split("id:").nth(1)?.split(' ').next()?.parse().ok())
+            .collect()
+    }
+
+    /// The ids of the nodes called `name`.
+    fn node_ids(name: &str) -> Vec<u32> {
+        nodes()
+            .into_iter()
+            .filter(|(_, n)| n == name)
+            .filter_map(|(id, _)| u32::try_from(id).ok())
+            .collect()
+    }
+
+    /// The `node.name`s of the nodes that node `id` links to, per `pw-dump`.
+    fn links_of(id: u32) -> Vec<String> {
+        let objects = dump_objects();
+        let name_of = |node: u64| {
+            objects
+                .iter()
+                .find(|o| o["type"] == "PipeWire:Interface:Node" && o["id"] == node)
+                .and_then(|o| o["info"]["props"]["node.name"].as_str())
+                .map(str::to_string)
+        };
+        objects
+            .iter()
+            .filter(|o| {
+                o["type"] == "PipeWire:Interface:Link"
+                    && o["info"]["output-node-id"] == u64::from(id)
+            })
+            .filter_map(|o| name_of(o["info"]["input-node-id"].as_u64()?))
+            .collect()
+    }
+
     fn default_sink_name() -> String {
         let line = metadata_line(0, "default.audio.sink").expect("a default sink");
         let json = line
@@ -1242,5 +1290,126 @@ mod tests {
             assert!(events.try_recv().is_err(), "round {round}: no failure");
             backend.stop().expect("stop");
         }
+    }
+
+    #[test]
+    #[ignore = "needs a live PipeWire session"]
+    fn unselecting_removes_a_target_node_entry_to_the_sink() {
+        // WirePlumber 0.4 restores a new stream of a selected app to the sink with a
+        // `target.node` entry. Left in place, it keeps the stream on the sink after the unselect.
+        let _lock = lock();
+        let app = format!("beatsync-test-{}", std::process::id());
+        let backend = PipeWireBackend::new().expect("backend");
+        let (io, mut events) = test_io();
+        backend.start(vec![app.clone()], io).expect("start");
+        let sink = sinks_of(std::process::id()).pop().expect("sink");
+        let sink_id = node_id(&sink).expect("sink node").to_string();
+        let _tone = play_silence(&app);
+        assert!(wait_until(Duration::from_secs(3), || linked_only_to(
+            &app, &sink
+        )));
+        let id = node_id(&app).expect("stream node");
+        set_metadata(id, "target.node", &sink_id);
+        assert!(wait_until(Duration::from_secs(3), || subjects_with(
+            "target.node",
+            &sink_id
+        ) == [id]));
+        backend.update_apps(Vec::new()).expect("update_apps");
+        let default = default_sink_name();
+        assert!(
+            wait_until(Duration::from_secs(3), || linked_only_to(&app, &default)),
+            "unselecting moves it back: {:?}",
+            links_from(&app)
+        );
+        assert_eq!(metadata_line(id, "target.node"), None);
+        assert_eq!(metadata_line(id, "target.object"), None);
+        backend.stop().expect("stop");
+        assert!(events.try_recv().is_err(), "no failure reported");
+    }
+
+    #[test]
+    #[ignore = "needs a live PipeWire session"]
+    fn stop_removes_every_entry_that_points_at_the_sink() {
+        // C4. On WirePlumber 0.4 the second stream gets a `target.node` entry to the sink from
+        // the restore of the first stream's move; the test writes it too, so 0.5 checks the same.
+        let _lock = lock();
+        let app = format!("beatsync-test-{}", std::process::id());
+        let backend = PipeWireBackend::new().expect("backend");
+        let (io, mut events) = test_io();
+        backend.start(vec![app.clone()], io).expect("start");
+        let sink = sinks_of(std::process::id()).pop().expect("sink");
+        let sink_id = node_id(&sink).expect("sink node").to_string();
+        let sink_serial = node_serial(&sink).expect("sink serial").to_string();
+        let _first = play_silence(&app);
+        assert!(wait_until(Duration::from_secs(3), || node_ids(&app).len()
+            == 1
+            && linked_only_to(&app, &sink)));
+        let first = node_ids(&app)[0];
+        let _second = play_silence(&app);
+        let on = |id: u32, node: &str| {
+            let l = links_of(id);
+            !l.is_empty() && l.iter().all(|n| n == node)
+        };
+        let mut ids = Vec::new();
+        assert!(
+            wait_until(Duration::from_secs(3), || {
+                ids = node_ids(&app);
+                ids.len() == 2 && ids.iter().all(|id| on(*id, &sink))
+            }),
+            "both streams on the sink"
+        );
+        let second = *ids.iter().find(|id| **id != first).expect("second stream");
+        set_metadata(second, "target.node", &sink_id);
+        assert!(wait_until(Duration::from_secs(3), || subjects_with(
+            "target.node",
+            &sink_id
+        )
+        .contains(&second)));
+        backend.stop().expect("stop");
+        assert_eq!(subjects_with("target.node", &sink_id), Vec::<u32>::new());
+        assert_eq!(
+            subjects_with("target.object", &sink_serial),
+            Vec::<u32>::new()
+        );
+        let default = default_sink_name();
+        assert!(wait_until(Duration::from_secs(3), || ids
+            .iter()
+            .all(|id| on(*id, &default))));
+        assert!(events.try_recv().is_err(), "no failure reported");
+    }
+
+    #[test]
+    #[ignore = "needs a live PipeWire session"]
+    fn a_target_node_entry_to_another_output_survives_the_stop() {
+        // Review Focus 3: WirePlumber 0.4 restores a remembered output with `target.node`.
+        let _lock = lock();
+        let app = format!("beatsync-test-{}", std::process::id());
+        let backend = PipeWireBackend::new().expect("backend");
+        let other = test_sink(&backend);
+        let other_id = node_id(&other).expect("test sink node").to_string();
+        let _tone = play_silence(&app);
+        wait_listed(&backend, &app);
+        let id = node_id(&app).expect("stream node");
+        set_metadata(id, "target.node", &other_id);
+        assert!(wait_until(Duration::from_secs(3), || linked_only_to(
+            &app, &other
+        )));
+        let (io, _events) = test_io();
+        backend.start(vec![app.clone()], io).expect("start");
+        let sink = sinks_of(std::process::id()).pop().expect("sink");
+        assert!(wait_until(Duration::from_secs(3), || linked_only_to(
+            &app, &sink
+        )));
+        backend.stop().expect("stop");
+        assert!(
+            wait_until(Duration::from_secs(3), || linked_only_to(&app, &other)),
+            "back on its output: {:?}",
+            links_from(&app)
+        );
+        assert!(
+            metadata_line(id, "target.node")
+                .is_some_and(|l| l.contains(&format!("value:'{other_id}'")))
+        );
+        assert_eq!(metadata_line(id, "target.object"), None);
     }
 }
