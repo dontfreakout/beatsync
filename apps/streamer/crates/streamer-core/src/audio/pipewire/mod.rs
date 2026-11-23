@@ -22,7 +22,7 @@ pub const OWN_APP_NAME: &str = "Beatsync Streamer";
 
 /// Wait for the core info and the WirePlumber client at startup.
 const INIT_TIMEOUT: Duration = Duration::from_secs(2);
-/// Wait for the sink to show up in the registry.
+/// Wait for the sink and a monitor port of it to show up in the registry.
 const SINK_TIMEOUT: Duration = Duration::from_secs(2);
 /// Wait for the server to confirm the restore and the sink removal.
 const STOP_TIMEOUT: Duration = Duration::from_secs(2);
@@ -1269,8 +1269,8 @@ mod tests {
     #[test]
     #[ignore = "needs a live PipeWire session"]
     fn capture_links_on_every_start() {
-        // With node.dont-reconnect, WirePlumber 0.4 destroys a capture whose new target is
-        // not ready after one rescan.
+        // With node.dont-reconnect, WirePlumber 0.4 destroys a capture whose new sink has no
+        // session item yet; its one rescan runs at once. Fails often under CPU load.
         let _lock = lock();
         let backend = PipeWireBackend::new().expect("backend");
         for round in 0..10 {

@@ -25,7 +25,7 @@ use pw::types::ObjectType;
 
 use super::capture::connect_capture;
 use super::playback::{NO_LOCAL_OUTPUT, PlaybackStream, connect_playback, local_copy_allowed};
-use super::routing::{Session, SinkGlobal, sink_name, sink_properties};
+use super::routing::{Session, SinkGlobal, is_monitor_port_of, sink_name, sink_properties};
 use super::{INIT_TIMEOUT, OWN_APP_NAME, SINK_TIMEOUT, STOP_TIMEOUT};
 use crate::audio::apps::{MetaValue, StreamNode, WirePlumber, check_versions, group_apps};
 use crate::audio::{AppInfo, AudioError, AudioEvent, AudioIo, OutputIo};
@@ -308,14 +308,15 @@ pub(super) fn run(
     drop(main_loop);
 }
 
-/// Globals the worker uses: nodes (streams and the sink), the `default` metadata and the
-/// WirePlumber client.
+/// Globals the worker uses: nodes (streams and the sink), monitor ports (the sink is ready
+/// once it has them), the `default` metadata and the WirePlumber client.
 fn is_relevant(global: &GlobalObject<&DictRef>) -> bool {
     let Some(props) = global.props else {
         return false;
     };
     match global.type_ {
         ObjectType::Node => true,
+        ObjectType::Port => props.get("port.monitor") == Some("true"),
         ObjectType::Metadata => props.get("metadata.name") == Some("default"),
         ObjectType::Client => props.get("application.name") == Some("WirePlumber"),
         _ => false,
@@ -536,7 +537,16 @@ impl Worker {
                     session.sink_global = Some(SinkGlobal {
                         id: global.id,
                         serial: serial.to_string(),
+                        monitor: false,
                     });
+                }
+            }
+            ObjectType::Port => {
+                if let Some(session) = &mut self.session
+                    && let Some(sink) = &mut session.sink_global
+                    && is_monitor_port_of(props, sink.id)
+                {
+                    sink.monitor = true;
                 }
             }
             ObjectType::Metadata => self.bind_metadata(global),
@@ -886,7 +896,8 @@ impl Worker {
         ));
     }
 
-    /// Answers the start once the sink is in the registry, after the first routing.
+    /// Answers the start once the sink is ready, so WirePlumber 0.4 can link the capture (see
+    /// [`Session::sink_ready`]); then routes and creates the capture.
     fn progress_start(&mut self, now: Instant) {
         let Some(session) = &mut self.session else {
             return;
@@ -894,7 +905,7 @@ impl Worker {
         let Some((deadline, _)) = &session.pending_start else {
             return;
         };
-        if session.sink_global.is_some() {
+        if session.sink_ready() {
             if session.answer_start(Ok(())) {
                 self.route(now);
                 self.start_media();
@@ -927,7 +938,7 @@ impl Worker {
         }
     }
 
-    /// Creates the capture of the sink's monitor once the sink exists and the first routing
+    /// Creates the capture of the sink's monitor once the sink is ready and the first routing
     /// ran. When the default output is one of our sinks, the session fails with no capture:
     /// the output, which follows the default output, would play into the capture.
     fn start_media(&mut self) {

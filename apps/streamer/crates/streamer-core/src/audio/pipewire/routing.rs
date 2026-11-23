@@ -9,6 +9,7 @@ use ::pipewire as pw;
 use pw::metadata::Metadata;
 use pw::node::Node;
 use pw::properties::{PropertiesBox, properties};
+use pw::spa::utils::dict::DictRef;
 
 use super::capture::CaptureStream;
 use super::thread::Reply;
@@ -58,6 +59,14 @@ pub(super) struct SinkGlobal {
     pub id: u32,
     /// `object.serial`, the value `target.object` takes.
     pub serial: String,
+    /// A monitor port of the sink is in the registry (see [`Session::sink_ready`]).
+    pub monitor: bool,
+}
+
+/// Whether the port with the registry props `props` is a monitor port of node `sink_id`.
+pub(super) fn is_monitor_port_of(props: &DictRef, sink_id: u32) -> bool {
+    props.get("port.monitor") == Some("true")
+        && props.get("node.id") == Some(sink_id.to_string().as_str())
 }
 
 /// One start..stop run: the sink, its capture, the selection and the streams moved to the
@@ -77,7 +86,7 @@ pub(super) struct Session {
     /// Streams that appeared during this run, with the time (see [`RESTORE_RACE`]).
     added: BTreeMap<u32, Instant>,
     route_at: Option<Instant>,
-    /// Answered when the sink shows up in the registry.
+    /// Answered when the sink is ready (see [`Session::sink_ready`]).
     pub pending_start: Option<(Instant, Reply<()>)>,
     failed: bool,
     events: tokio::sync::mpsc::UnboundedSender<AudioEvent>,
@@ -119,6 +128,16 @@ impl Session {
             capture_tx: Some(capture_tx),
             capture: None,
         }
+    }
+
+    /// Whether the start can go on: the sink and a monitor port of it are in the registry.
+    ///
+    /// WirePlumber gives the sink its ports when it activates the sink's session item, after
+    /// it registered that item. WirePlumber 0.4 destroys a capture with `node.dont-reconnect`
+    /// whose target has no item yet ("target not found"); while the target's item activates,
+    /// it waits. Under load the capture's item was handled 2 ms before the sink's item existed.
+    pub fn sink_ready(&self) -> bool {
+        self.sink_global.as_ref().is_some_and(|s| s.monitor)
     }
 
     /// Routing runs once the sink exists and until a failure.
@@ -390,4 +409,22 @@ fn write_target(
 fn clear_target_node(metadata: &Metadata, node_targets: &mut BTreeMap<u32, String>, node_id: u32) {
     metadata.set_property(node_id, TARGET_NODE, None, None);
     node_targets.remove(&node_id);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_monitor_port_of_the_sink_makes_it_ready() {
+        // A monitor port of another node (a device plugged in during the start) would start
+        // the capture before WirePlumber 0.4 has an item for the sink.
+        ::pipewire::init();
+        let monitor = properties! { "node.id" => "42", "port.monitor" => "true" };
+        let other = properties! { "node.id" => "43", "port.monitor" => "true" };
+        let playback = properties! { "node.id" => "42", "port.name" => "playback_FL" };
+        assert!(is_monitor_port_of(monitor.as_ref(), 42));
+        assert!(!is_monitor_port_of(other.as_ref(), 42), "another node");
+        assert!(!is_monitor_port_of(playback.as_ref(), 42), "an input port");
+    }
 }
