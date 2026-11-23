@@ -145,11 +145,12 @@ mod tests {
     //! `pw-metadata`, `pw-cli`. They touch only what they create: their own sinks, the
     //! streamer's capture and output streams (the output plays silence to a test sink of its
     //! own: its rings stay empty, its gain is 0 and the metronome is off), and `pw-cat`
-    //! streams that play silence from `/dev/zero`. Other streams and the default devices stay
+    //! streams that play silence (zeros). Other streams and the default devices stay
     //! as they are. The tests run one at a time (`LOCK`), and every child process is killed on
     //! exit, also when a test fails.
 
     use std::collections::BTreeMap;
+    use std::io::Write;
     use std::process::{Child, Command as Process, Stdio};
     use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -242,19 +243,48 @@ mod tests {
     }
 
     /// Plays silence as app `name` (also its `node.name`). WirePlumber stores nothing for it.
+    /// `pw-cat` reads a WAV stream from stdin: [`silent_wav_header`], then zeros until the
+    /// guard kills it. pw-cat 1.0 has no raw mode (`--raw`) and cannot read a headerless file.
     fn play_silence(name: &str) -> ChildGuard {
         let props = format!(
             "{{ application.name = \"{name}\" node.name = \"{name}\" \
              state.restore-props = false state.restore-target = false }}"
         );
-        let child = Process::new("pw-cat")
-            .args(["-p", "--raw", "--rate", "48000", "--channels", "2"])
-            .args(["--format", "f32", "--properties", &props, "/dev/zero"])
+        let mut child = Process::new("pw-cat")
+            .args(["-p", "--properties", &props, "-"])
+            .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .expect("pw-cat");
+        let mut stdin = child.stdin.take().expect("pw-cat stdin");
+        std::thread::spawn(move || {
+            // A write fails (EPIPE) once pw-cat is gone, which ends the thread.
+            let zeros = [0u8; 4096];
+            let _ = stdin.write_all(&silent_wav_header());
+            while stdin.write_all(&zeros).is_ok() {}
+        });
         ChildGuard(child)
+    }
+
+    /// Header of a 16-bit stereo 48 kHz PCM WAV stream with the largest data length (6 h).
+    fn silent_wav_header() -> Vec<u8> {
+        let data_len = u32::MAX - 36;
+        [
+            &b"RIFF"[..],
+            &(data_len + 36).to_le_bytes(),
+            b"WAVEfmt ",
+            &16u32.to_le_bytes(), // size of the fmt chunk
+            &1u16.to_le_bytes(),  // PCM
+            &2u16.to_le_bytes(),  // channels
+            &48_000u32.to_le_bytes(),
+            &192_000u32.to_le_bytes(), // bytes per second
+            &4u16.to_le_bytes(),       // bytes per frame
+            &16u16.to_le_bytes(),      // bits per sample
+            b"data",
+            &data_len.to_le_bytes(),
+        ]
+        .concat()
     }
 
     pub(super) fn output(program: &str, args: &[&str]) -> String {
@@ -262,12 +292,23 @@ mod tests {
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
+    /// The objects in `pw-dump`. pw-dump 1.0 also prints `[{ "id": N, "info": null }]` for
+    /// each object removed while it runs; these entries have no `type`.
+    fn dump_objects() -> Vec<Value> {
+        let out = output("pw-dump", &[]);
+        serde_json::Deserializer::from_str(&out)
+            .into_iter::<Value>()
+            .flat_map(|doc| match doc.expect("pw-dump JSON") {
+                Value::Array(objects) => objects,
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+
     /// `(id, node.name)` of every node in `pw-dump`.
     pub(super) fn nodes() -> Vec<(u64, String)> {
-        let dump: Value = serde_json::from_str(&output("pw-dump", &[])).expect("pw-dump JSON");
-        dump.as_array()
-            .into_iter()
-            .flatten()
+        dump_objects()
+            .iter()
             .filter(|o| o["type"] == "PipeWire:Interface:Node")
             .filter_map(|o| {
                 let name = o["info"]["props"]["node.name"].as_str()?;
@@ -292,8 +333,8 @@ mod tests {
     }
 
     fn node_serial(name: &str) -> Option<u64> {
-        let dump: Value = serde_json::from_str(&output("pw-dump", &[])).ok()?;
-        let node = dump.as_array()?.iter().find(|o| {
+        let objects = dump_objects();
+        let node = objects.iter().find(|o| {
             o["type"] == "PipeWire:Interface:Node" && o["info"]["props"]["node.name"] == name
         })?;
         node["info"]["props"]["object.serial"].as_u64()
@@ -787,11 +828,6 @@ mod tests {
         backend.stop().expect("stop");
     }
 
-    fn dump_objects() -> Vec<Value> {
-        let dump: Value = serde_json::from_str(&output("pw-dump", &[])).expect("pw-dump JSON");
-        dump.as_array().cloned().unwrap_or_default()
-    }
-
     /// Ids of this process's nodes named `name`.
     fn own_nodes(name: &str) -> Vec<u32> {
         own_nodes_in(&dump_objects(), name)
@@ -1106,8 +1142,21 @@ mod tests {
         let (io, mut events) = test_io();
         backend.start(Vec::new(), io).expect("start");
         let sink = sinks_of(std::process::id()).pop().expect("sink");
-        let id = node_id(&sink).expect("sink node").to_string();
-        output("pw-cli", &["destroy", &id]);
+        assert!(
+            wait_until(Duration::from_secs(3), || linked_only_to(
+                &sink,
+                CAPTURE_NAME
+            )),
+            "the capture reads the sink's monitor: {:?}",
+            links_from(&sink)
+        );
+        // Not `pw-cli destroy`: see `Command::DropSink`.
+        let dropped = backend.call(Command::DropSink);
+        dropped.expect("drop sink");
+        assert!(
+            wait_until(Duration::from_secs(3), || node_id(&sink).is_none()),
+            "the sink is gone"
+        );
         let failed = wait_until(Duration::from_secs(3), || {
             matches!(events.try_recv(), Ok(AudioEvent::Failed(_)))
         });

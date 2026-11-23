@@ -212,6 +212,12 @@ impl Session {
         }
     }
 
+    /// Destroys the sink on the server and leaves everything else as it is.
+    #[cfg(test)]
+    pub fn drop_sink(&mut self) {
+        drop(self.sink.take());
+    }
+
     /// Reports a failure to the runtime once and stops routing.
     pub fn fail(&mut self, message: &str) {
         if !self.failed {

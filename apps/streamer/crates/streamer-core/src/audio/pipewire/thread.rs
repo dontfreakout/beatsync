@@ -78,6 +78,12 @@ pub(super) enum Command {
         value: String,
         reply: Reply<()>,
     },
+    /// Destroys the session's sink through its proxy, with the capture still connected: the
+    /// sink disappears as if another client removed it. PipeWire before 1.3.81 aborts when
+    /// another client destroys a null sink whose owner is still connected (`pw-cli destroy`,
+    /// PipeWire issue 4250).
+    #[cfg(test)]
+    DropSink(Reply<()>),
 }
 
 /// A command and when its caller stops waiting for the answer.
@@ -780,6 +786,13 @@ impl Worker {
                 Command::FakeDefaultSink { value, reply } => {
                     self.fake_default_sink = Some(value);
                     self.guard_local_output();
+                    let _ = reply.send(Ok(()));
+                }
+                #[cfg(test)]
+                Command::DropSink(reply) => {
+                    if let Some(session) = &mut self.session {
+                        session.drop_sink();
+                    }
                     let _ = reply.send(Ok(()));
                 }
             }
