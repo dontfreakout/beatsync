@@ -25,4 +25,7 @@ symphonia-adapter-libopus = "0.3.0"
 rubato = "5.1.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-pipewire = { version = "0.10.1", features = ["v1_2_0"] }
+# v1_0_0: the oldest PipeWire the app supports (audio::apps::check_versions). The bindings
+# come from the PipeWire headers of the build system, and the Linux bundles are built
+# on Ubuntu 24.04 (PipeWire 1.0, see packaging/linux/Dockerfile).
+pipewire = { version = "0.10.1", features = ["v1_0_0"] }
