@@ -123,6 +123,7 @@ S3_SECRET_ACCESS_KEY=
 - **PM2**: Config in `pm2.config.js`. Process name: `beatsync-server`.
 - Server has graceful shutdown (SIGTERM/SIGINT) that backs up state to R2 before exit.
 - **Streamer Linux bundles** (`apps/streamer`): build bundles for other people with `bun run app:build:linux` (Ubuntu 24.04 container, runs on glibc 2.39+, output in `target/linux-release/`). A host `bun run app:build` bundles the host's GTK/WebKit libraries, and the AppImage then fails on older distributions with "version `GLIBC_2.xx' not found".
+- `bun run core:test:ubuntu24` runs the streamer-core unit tests and the PipeWire integration tests against PipeWire 1.0.5 and WirePlumber 0.4.17 in a container.
 
 ## Development Notes
 

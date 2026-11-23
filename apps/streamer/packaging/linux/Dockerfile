@@ -16,7 +16,7 @@ ARG RUST_VERSION=1.99.1
 # Tauri prerequisites (tauri.app/start/prerequisites), PipeWire headers and clang
 # for the pipewire crate, cmake for the bundled libopus, the tools of
 # check-glibc.sh (binutils from build-essential, dpkg, rpm2cpio, cpio), and
-# inotify-tools for the inotify check in build-in-container.sh.
+# inotify-tools for the inotify check in lib.sh.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       build-essential ca-certificates curl wget file pkg-config \
@@ -35,3 +35,10 @@ COPY --from=bun /usr/local/bin/bun /usr/local/bin/bun
 
 # linuxdeploy and appimagetool are AppImages themselves. A container has no FUSE.
 ENV APPIMAGE_EXTRACT_AND_RUN=1
+
+# Test image: the build image plus a headless PipeWire 1.0.5 and WirePlumber 0.4.17,
+# the oldest versions the app supports (Linux Mint 22).
+FROM build AS test
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends pipewire wireplumber pipewire-bin dbus \
+ && rm -rf /var/lib/apt/lists/*

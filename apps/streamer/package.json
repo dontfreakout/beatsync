@@ -11,6 +11,7 @@
     "web:dev": "vite --port 1420 --strictPort",
     "web:build": "tsc --noEmit && vite build",
     "core:test": "cargo test -p streamer-core",
+    "core:test:ubuntu24": "bash packaging/linux/test-pipewire.sh",
     "typecheck": "tsc --noEmit",
     "test": "bun test src"
   },
