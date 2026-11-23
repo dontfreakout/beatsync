@@ -40,12 +40,16 @@ fn capture_properties(target: &str) -> PropertiesBox {
         *pw::keys::MEDIA_CATEGORY => "Capture",
         *pw::keys::STREAM_CAPTURE_SINK => "true",
         *pw::keys::TARGET_OBJECT => target,
-        // Never fall back to a microphone or another sink if the target is missing.
+        // Never fall back to a microphone or another sink if the target is missing, and never
+        // let the session manager move the capture. WirePlumber 0.5 knows only the first key,
+        // 0.4 only the second; a move from outside the app is ignored (spec F3).
         "node.dont-fallback" => "true",
+        "node.dont-reconnect" => "true",
         *pw::keys::NODE_LATENCY => LATENCY,
         // Excluded from the app list and from routing.
         *pw::keys::APP_NAME => OWN_APP_NAME,
         // WirePlumber stores nothing for it, so it never restores a stale per-run target.
+        // WirePlumber 0.4 ignores these string flags (spec 8.3, accepted difference).
         "state.restore-props" => "false",
         "state.restore-target" => "false",
     }
@@ -214,6 +218,16 @@ mod tests {
     use super::*;
 
     const MS: i64 = 1_000_000;
+
+    #[test]
+    fn the_capture_never_takes_another_source() {
+        ::pipewire::init();
+        let props = capture_properties("beatsync-1-1");
+        assert_eq!(props.get("target.object"), Some("beatsync-1-1"));
+        // 0.5 knows only the first, 0.4 only the second (spec F3).
+        assert_eq!(props.get("node.dont-fallback"), Some("true"));
+        assert_eq!(props.get("node.dont-reconnect"), Some("true"));
+    }
 
     fn timing(delay: i64, buffered: u64, rate_denom: u32) -> Timing {
         Timing {

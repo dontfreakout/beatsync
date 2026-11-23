@@ -836,6 +836,18 @@ mod tests {
     /// `node.name`s of the nodes that this process's nodes named `name` link to, one per
     /// link. Same-named nodes of other processes (a running streamer) do not count.
     pub(super) fn own_links(name: &str) -> Vec<String> {
+        linked_nodes(name, "output-node-id", "input-node-id")
+    }
+
+    /// `node.name`s of the nodes that link into this process's nodes named `name`, one per
+    /// link: [`own_links`] the other way round.
+    fn own_sources(name: &str) -> Vec<String> {
+        linked_nodes(name, "input-node-id", "output-node-id")
+    }
+
+    /// The `node.name` at the `far` end of every link whose `near` end is a node of this
+    /// process named `name`.
+    fn linked_nodes(name: &str, near: &str, far: &str) -> Vec<String> {
         let objects = dump_objects();
         let own = own_nodes_in(&objects, name);
         let names: BTreeMap<u64, &str> = objects
@@ -847,10 +859,10 @@ mod tests {
             .iter()
             .filter(|o| o["type"] == "PipeWire:Interface:Link")
             .filter(|o| {
-                let from = o["info"]["output-node-id"].as_u64();
-                from.is_some_and(|id| own.iter().any(|own| u64::from(*own) == id))
+                let id = o["info"][near].as_u64();
+                id.is_some_and(|id| own.iter().any(|own| u64::from(*own) == id))
             })
-            .filter_map(|o| names.get(&o["info"]["input-node-id"].as_u64()?))
+            .filter_map(|o| names.get(&o["info"][far].as_u64()?))
             .map(|name| name.to_string())
             .collect()
     }
@@ -1136,7 +1148,8 @@ mod tests {
 
     #[test]
     #[ignore = "needs a live PipeWire session"]
-    fn reports_a_removed_sink() {
+    fn a_removed_sink_never_sends_another_node_into_the_capture() {
+        // C1: on WirePlumber 0.4 the capture fell back to the default output's monitor.
         let _lock = lock();
         let backend = PipeWireBackend::new().expect("backend");
         let (io, mut events) = test_io();
@@ -1157,10 +1170,77 @@ mod tests {
             wait_until(Duration::from_secs(3), || node_id(&sink).is_none()),
             "the sink is gone"
         );
-        let failed = wait_until(Duration::from_secs(3), || {
-            matches!(events.try_recv(), Ok(AudioEvent::Failed(_)))
-        });
-        assert!(failed, "the runtime hears that the sink is gone");
+        let end = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < end {
+            let sources = own_sources(CAPTURE_NAME);
+            assert!(
+                sources.iter().all(|n| *n == sink),
+                "the capture reads {sources:?}"
+            );
+        }
+        assert!(
+            own_nodes(CAPTURE_NAME).is_empty(),
+            "the capture stream is gone"
+        );
+        assert!(
+            matches!(events.try_recv(), Ok(AudioEvent::Failed(_))),
+            "failure reported"
+        );
         backend.stop().expect("stop");
+    }
+
+    #[test]
+    #[ignore = "needs a live PipeWire session"]
+    fn a_removed_target_never_sends_the_output_elsewhere() {
+        // C2: a pinned output must not go to the default output when its target disappears.
+        let _lock = lock();
+        let backend = PipeWireBackend::new().expect("backend");
+        let out_sink = test_sink(&backend);
+        let mut output_events = open_test_output(&backend, &out_sink);
+        // Not `pw-cli destroy`: see `Command::DropSink`.
+        let dropped = backend.call(|reply| Command::DropTestSink {
+            name: out_sink.clone(),
+            reply,
+        });
+        dropped.expect("drop test sink");
+        let end = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < end {
+            let links = own_links(PLAYBACK_NAME);
+            assert!(
+                links.iter().all(|n| *n == out_sink),
+                "the output plays to {links:?}"
+            );
+        }
+        assert!(own_nodes(PLAYBACK_NAME).is_empty(), "the output is gone");
+        assert!(
+            matches!(output_events.try_recv(), Ok(AudioEvent::OutputFailed(_))),
+            "failure reported"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs a live PipeWire session"]
+    fn capture_links_on_every_start() {
+        // With node.dont-reconnect, WirePlumber 0.4 destroys a capture whose new target is
+        // not ready after one rescan.
+        let _lock = lock();
+        let backend = PipeWireBackend::new().expect("backend");
+        for round in 0..10 {
+            let (io, mut events) = test_io();
+            backend.start(Vec::new(), io).expect("start");
+            let sinks = sinks_of(std::process::id());
+            assert_eq!(sinks.len(), 1, "round {round}: one sink");
+            assert!(
+                wait_until(Duration::from_secs(3), || linked_only_to(
+                    &sinks[0],
+                    CAPTURE_NAME
+                )),
+                "round {round}: the capture reads the sink: {:?}",
+                links_from(&sinks[0])
+            );
+            std::thread::sleep(Duration::from_millis(200));
+            assert!(events.try_recv().is_err(), "round {round}: no failure");
+            backend.stop().expect("stop");
+        }
     }
 }

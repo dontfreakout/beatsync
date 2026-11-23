@@ -84,6 +84,13 @@ pub(super) enum Command {
     /// PipeWire issue 4250).
     #[cfg(test)]
     DropSink(Reply<()>),
+    /// Destroys the sink `name` of [`Command::CreateSink`] through its proxy (a pinned
+    /// output loses its target). Not `pw-cli destroy`: see [`Command::DropSink`].
+    #[cfg(test)]
+    DropTestSink {
+        name: String,
+        reply: Reply<()>,
+    },
 }
 
 /// A command and when its caller stops waiting for the answer.
@@ -353,7 +360,7 @@ struct Worker {
     media_created: u64,
     /// Sinks of [`Command::CreateSink`]; dropping a proxy destroys its sink.
     #[cfg(test)]
-    test_sinks: Vec<Node>,
+    test_sinks: Vec<(String, Node)>,
     /// The `default.audio.sink` value of [`Command::FakeDefaultSink`].
     #[cfg(test)]
     fake_default_sink: Option<String>,
@@ -779,7 +786,7 @@ impl Worker {
                     let sink = self
                         .core
                         .create_object::<Node>("adapter", &sink_properties(&name));
-                    let result = sink.map(|sink| self.test_sinks.push(sink));
+                    let result = sink.map(|sink| self.test_sinks.push((name, sink)));
                     let _ = reply.send(result.map_err(|e| AudioError::Backend(e.to_string())));
                 }
                 #[cfg(test)]
@@ -793,6 +800,11 @@ impl Worker {
                     if let Some(session) = &mut self.session {
                         session.drop_sink();
                     }
+                    let _ = reply.send(Ok(()));
+                }
+                #[cfg(test)]
+                Command::DropTestSink { name, reply } => {
+                    self.test_sinks.retain(|(sink, _)| *sink != name);
                     let _ = reply.send(Ok(()));
                 }
             }
