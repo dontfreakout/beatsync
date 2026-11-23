@@ -27,7 +27,7 @@ use super::capture::connect_capture;
 use super::playback::{NO_LOCAL_OUTPUT, PlaybackStream, connect_playback, local_copy_allowed};
 use super::routing::{Session, SinkGlobal, sink_name, sink_properties};
 use super::{INIT_TIMEOUT, OWN_APP_NAME, SINK_TIMEOUT, STOP_TIMEOUT};
-use crate::audio::apps::{MetaValue, StreamNode, check_versions, group_apps};
+use crate::audio::apps::{MetaValue, StreamNode, WirePlumber, check_versions, group_apps};
 use crate::audio::{AppInfo, AudioError, AudioEvent, AudioIo, OutputIo};
 use crate::mixer::Mixer;
 
@@ -706,7 +706,14 @@ impl Worker {
                 (None, None) => Err(AudioError::Unavailable(
                     "the PipeWire server did not answer".to_string(),
                 )),
-                (None, Some(version)) => check_versions(version, inbox.wp_version.as_deref()),
+                (None, Some(version)) => {
+                    let wireplumber = match (self.wireplumber.is_empty(), &inbox.wp_version) {
+                        (true, _) => WirePlumber::Missing,
+                        (false, Some(version)) => WirePlumber::Version(version),
+                        (false, None) => WirePlumber::Unversioned,
+                    };
+                    check_versions(version, wireplumber)
+                }
             }
         };
         if result.is_err() {

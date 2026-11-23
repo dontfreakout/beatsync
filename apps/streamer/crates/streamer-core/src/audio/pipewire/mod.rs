@@ -1,4 +1,4 @@
-//! PipeWire backend (Linux, spec §9.3): needs PipeWire 1.0 and WirePlumber 0.5 or later.
+//! PipeWire backend (Linux, spec §9.3): needs PipeWire 1.0 and WirePlumber 0.4.17 or later.
 
 use std::sync::mpsc;
 use std::thread::JoinHandle;
@@ -138,7 +138,10 @@ mod tests {
     //! cd apps/streamer && cargo test -p streamer-core -- --ignored pipewire
     //! ```
     //!
-    //! They need PipeWire 1.0+, WirePlumber 0.5+ and `pw-cat`, `pw-dump`, `pw-link`,
+    //! `bun run core:test:ubuntu24` (in `apps/streamer`) runs them in a container with
+    //! PipeWire 1.0.5 and WirePlumber 0.4.17.
+    //!
+    //! They need PipeWire 1.0+, WirePlumber 0.4.17+ and `pw-cat`, `pw-dump`, `pw-link`,
     //! `pw-metadata`, `pw-cli`. They touch only what they create: their own sinks, the
     //! streamer's capture and output streams (the output plays silence to a test sink of its
     //! own: its rings stay empty, its gain is 0 and the metronome is off), and `pw-cat`

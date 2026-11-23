@@ -136,12 +136,30 @@ pub fn moved_away(
         .collect()
 }
 
-/// PipeWire 1.0 and WirePlumber 0.5 or later; no WirePlumber is an error.
-pub fn check_versions(pipewire: &str, wireplumber: Option<&str>) -> Result<(), AudioError> {
+/// The WirePlumber client as the registry shows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WirePlumber<'a> {
+    /// No client with `application.name` "WirePlumber".
+    Missing,
+    /// A WirePlumber client without `application.version`: WirePlumber 0.4 publishes none.
+    Unversioned,
+    /// The client's `application.version` (WirePlumber 0.5 and later).
+    Version(&'a str),
+}
+
+/// PipeWire 1.0 and WirePlumber 0.4.17 or later; no WirePlumber client is an error. An
+/// unversioned client counts as WirePlumber 0.4.
+pub fn check_versions(pipewire: &str, wireplumber: WirePlumber<'_>) -> Result<(), AudioError> {
     let at_least = |version: &str, min: (u32, u32, u32)| parse_version(version) >= Some(min);
-    match wireplumber {
-        Some(wp) if at_least(pipewire, (1, 0, 0)) && at_least(wp, (0, 5, 0)) => Ok(()),
-        _ => Err(AudioError::UnsupportedVersions),
+    let wireplumber_ok = match wireplumber {
+        WirePlumber::Missing => false,
+        WirePlumber::Unversioned => true,
+        WirePlumber::Version(version) => at_least(version, (0, 4, 17)),
+    };
+    if wireplumber_ok && at_least(pipewire, (1, 0, 0)) {
+        Ok(())
+    } else {
+        Err(AudioError::UnsupportedVersions)
     }
 }
 
@@ -301,23 +319,21 @@ mod tests {
 
     #[test]
     fn versions() {
-        assert_eq!(check_versions("1.6.11", Some("0.5.19")), Ok(()));
-        assert_eq!(check_versions("1.0.0", Some("0.5.0")), Ok(()));
-        assert_eq!(
-            check_versions("0.3.80", Some("0.5.19")),
-            Err(AudioError::UnsupportedVersions)
-        );
-        assert_eq!(
-            check_versions("1.0.0", Some("0.4.17")),
-            Err(AudioError::UnsupportedVersions)
-        );
-        assert_eq!(
-            check_versions("1.6.11", None),
-            Err(AudioError::UnsupportedVersions)
-        );
+        use WirePlumber::{Missing, Unversioned, Version};
+        let unsupported = Err(AudioError::UnsupportedVersions);
+        // Linux Mint 22.3: PipeWire 1.0.5 and WirePlumber 0.4.17, which publishes no version.
+        assert_eq!(check_versions("1.0.5", Unversioned), Ok(()));
+        assert_eq!(check_versions("1.0.0", Version("0.4.17")), Ok(()));
+        assert_eq!(check_versions("1.6.11", Version("0.5.19")), Ok(()));
+        assert_eq!(check_versions("1.0.0", Version("0.5.0-dev")), Ok(()));
+        assert_eq!(check_versions("1.0.0", Version("0.4.16")), unsupported);
+        assert_eq!(check_versions("1.0.0", Version("unknown")), unsupported);
+        assert_eq!(check_versions("0.3.80", Unversioned), unsupported);
+        assert_eq!(check_versions("0.3.80", Version("0.5.19")), unsupported);
+        assert_eq!(check_versions("1.6.11", Missing), unsupported);
         assert_eq!(
             AudioError::UnsupportedVersions.to_string(),
-            "PipeWire 1.0 and WirePlumber 0.5 or later required"
+            "PipeWire 1.0 and WirePlumber 0.4.17 or later required"
         );
     }
 }

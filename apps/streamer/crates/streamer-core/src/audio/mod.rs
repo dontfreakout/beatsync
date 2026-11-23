@@ -29,7 +29,7 @@ pub struct AppInfo {
 }
 
 /// The user-facing error when the audio system does not fit (spec §9.9, exact copy).
-pub const REQUIRED_VERSIONS: &str = "PipeWire 1.0 and WirePlumber 0.5 or later required";
+pub const REQUIRED_VERSIONS: &str = "PipeWire 1.0 and WirePlumber 0.4.17 or later required";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AudioError {
@@ -220,7 +220,7 @@ mod tests {
         assert_eq!(
             lines,
             [
-                "PipeWire 1.0 and WirePlumber 0.5 or later required",
+                "PipeWire 1.0 and WirePlumber 0.4.17 or later required",
                 "PipeWire is not available: cannot connect to the PipeWire server: x",
             ]
         );
