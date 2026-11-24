@@ -54,7 +54,8 @@ standin_is_default() {
 
 wait_for "WirePlumber client" wireplumber_client
 
-pw-cli create-node adapter '{ factory.name = support.null-audio-sink node.name = beatsync-standin-output node.description = "Stand-in output" media.class = Audio/Sink audio.position = [ FL FR ] priority.session = 1000 object.linger = true }' >/dev/null
+pw-cli create-node adapter '{ factory.name = support.null-audio-sink node.name = beatsync-standin-output node.description = "Stand-in output" media.class = Audio/Sink audio.position = [ FL FR ] priority.session = 1000 object.linger = true }' >/dev/null \
+  || fail "cannot create the stand-in output"
 
 wait_for "default sink beatsync-standin-output" standin_is_default
 

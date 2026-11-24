@@ -12,6 +12,7 @@
     "web:build": "tsc --noEmit && vite build",
     "core:test": "cargo test -p streamer-core",
     "core:test:ubuntu24": "bash packaging/linux/test-pipewire.sh",
+    "app:check:mint": "bash packaging/linux/check-mint.sh",
     "typecheck": "tsc --noEmit",
     "test": "bun test src"
   },
