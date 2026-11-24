@@ -9,6 +9,7 @@ use ::pipewire as pw;
 use pw::metadata::Metadata;
 use pw::node::Node;
 use pw::properties::{PropertiesBox, properties};
+use pw::spa::utils::dict::DictRef;
 
 use super::capture::CaptureStream;
 use super::thread::Reply;
@@ -19,6 +20,9 @@ use crate::audio::apps::{
 use crate::audio::{AudioError, AudioEvent, AudioIo, CapturedChunk, PlayoutShared};
 
 const TARGET_OBJECT: &str = "target.object";
+/// WirePlumber 0.4's stream-restore writes this entry (value: a node id) when it restores a
+/// stream to an output; WirePlumber 0.5 honours it too.
+const TARGET_NODE: &str = "target.node";
 
 /// `node.name` of the `n`-th sink of process `pid`.
 pub(super) fn sink_name(pid: u32, n: u32) -> String {
@@ -45,7 +49,10 @@ pub(super) fn sink_properties(node_name: &str) -> PropertiesBox {
         // WirePlumber picks the default output and input by this priority (real devices
         // have 1000 and more), so the sink never becomes a default.
         "priority.session" => "0",
-        // Keeps per-run entries out of WirePlumber's stream-properties state file.
+        // Keeps per-run entries out of WirePlumber's stream-properties state file. This holds on
+        // WirePlumber 0.5. WirePlumber 0.4 ignores the string value "false", so its state file
+        // (`restore-stream`) grows by a few lines per run. That is accepted: a stable sink name
+        // would let 0.4 restore apps onto the next run's sink, which is worse.
         "state.restore-props" => "false",
     }
 }
@@ -55,6 +62,38 @@ pub(super) struct SinkGlobal {
     pub id: u32,
     /// `object.serial`, the value `target.object` takes.
     pub serial: String,
+    /// A monitor port of the sink is in the registry (see [`Session::sink_ready`]).
+    pub monitor: bool,
+}
+
+/// Whether the port with the registry props `props` is a monitor port of node `sink_id`.
+pub(super) fn is_monitor_port_of(props: &DictRef, sink_id: u32) -> bool {
+    props.get("port.monitor") == Some("true")
+        && props.get("node.id") == Some(sink_id.to_string().as_str())
+}
+
+/// The error for a start that waits for the sink, or `None` while it keeps waiting. A failed
+/// session answers at once with its own reason. At the deadline the message tells where the
+/// wait stopped: the sink node never appeared, or WirePlumber did not finish setting it up.
+pub(super) fn start_error(
+    failure: Option<&str>,
+    sink_known: bool,
+    deadline_passed: bool,
+) -> Option<String> {
+    if let Some(reason) = failure {
+        return Some(reason.to_string());
+    }
+    if !deadline_passed {
+        return None;
+    }
+    Some(
+        if sink_known {
+            "WirePlumber did not set up the Beatsync sink"
+        } else {
+            "The Beatsync sink did not appear"
+        }
+        .to_string(),
+    )
 }
 
 /// One start..stop run: the sink, its capture, the selection and the streams moved to the
@@ -74,9 +113,10 @@ pub(super) struct Session {
     /// Streams that appeared during this run, with the time (see [`RESTORE_RACE`]).
     added: BTreeMap<u32, Instant>,
     route_at: Option<Instant>,
-    /// Answered when the sink shows up in the registry.
+    /// Answered when the sink is ready (see [`Session::sink_ready`]).
     pub pending_start: Option<(Instant, Reply<()>)>,
-    failed: bool,
+    /// The reason of the first failure, once the session failed.
+    failed: Option<String>,
     events: tokio::sync::mpsc::UnboundedSender<AudioEvent>,
     pub shared: Arc<PlayoutShared>,
     /// The capture ring's end, until the capture stream takes it.
@@ -110,7 +150,7 @@ impl Session {
             added: BTreeMap::new(),
             route_at: None,
             pending_start: Some((start_deadline, reply)),
-            failed: false,
+            failed: None,
             events,
             shared,
             capture_tx: Some(capture_tx),
@@ -118,9 +158,29 @@ impl Session {
         }
     }
 
+    /// Whether the start can go on: the sink and a monitor port of it are in the registry.
+    ///
+    /// WirePlumber gives the sink its ports when it activates the sink's session item, after
+    /// it registered that item. WirePlumber 0.4 destroys a capture with `node.dont-reconnect`
+    /// whose target has no item yet ("target not found"); while the target's item activates,
+    /// it waits. Under load the capture's item was handled 2 ms before the sink's item existed.
+    pub fn sink_ready(&self) -> bool {
+        self.sink_global.as_ref().is_some_and(|s| s.monitor)
+    }
+
+    /// Why the session failed, if it did.
+    pub fn failure(&self) -> Option<&str> {
+        self.failed.as_deref()
+    }
+
+    /// Whether the sink node is in the registry (its monitor port may not be).
+    pub fn sink_known(&self) -> bool {
+        self.sink_global.is_some()
+    }
+
     /// Routing runs once the sink exists and until a failure.
     pub fn is_routing(&self) -> bool {
-        self.sink_global.is_some() && self.pending_start.is_none() && !self.failed
+        self.sink_global.is_some() && self.pending_start.is_none() && self.failed.is_none()
     }
 
     pub fn route_at(&self) -> Option<Instant> {
@@ -212,10 +272,16 @@ impl Session {
         }
     }
 
+    /// Destroys the sink on the server and leaves everything else as it is.
+    #[cfg(test)]
+    pub fn drop_sink(&mut self) {
+        drop(self.sink.take());
+    }
+
     /// Reports a failure to the runtime once and stops routing.
     pub fn fail(&mut self, message: &str) {
-        if !self.failed {
-            self.failed = true;
+        if self.failed.is_none() {
+            self.failed = Some(message.to_string());
             let _ = self.events.send(AudioEvent::Failed(message.to_string()));
         }
     }
@@ -227,11 +293,13 @@ impl Session {
         metadata: &Metadata,
         nodes: &[StreamNode],
         targets: &mut BTreeMap<u32, MetaValue>,
+        node_targets: &mut BTreeMap<u32, String>,
         now: Instant,
     ) {
         let Some(serial) = self.sink_global.as_ref().map(|s| s.serial.clone()) else {
             return;
         };
+        let sink_node = self.sink_global.as_ref().map(|s| s.id.to_string());
         self.added
             .retain(|_, at| now.saturating_duration_since(*at) <= RESTORE_RACE);
         self.release_moved_away(targets, &serial, now);
@@ -264,6 +332,10 @@ impl Session {
                 RouteAction::Restore { node_id } => {
                     let previous = self.moved.remove(&node_id).flatten();
                     write_target(metadata, targets, node_id, previous);
+                    // A `target.node` entry to the sink would keep the stream there (K1).
+                    if node_targets.get(&node_id) == sink_node.as_ref() {
+                        clear_target_node(metadata, node_targets, node_id);
+                    }
                 }
             }
         }
@@ -271,11 +343,20 @@ impl Session {
 
     /// Gives every moved stream that still points at the sink its previous target back (or
     /// deletes the entry), and deletes every other entry that points at the sink. Streams the
-    /// user moved away keep the user's target.
+    /// user moved away keep the user's target. Also deletes every `target.node` entry that
+    /// points at the sink (C4); entries to other nodes stay, so a stream goes back to a
+    /// remembered output.
+    ///
+    /// Accepted WirePlumber 0.4 difference (K2): 0.4 saves the sink as the app's target when
+    /// it moves a stream, and clears that when the entry is deleted. So 0.4 forgets the app's
+    /// remembered output once the app was streamed. Its streams still go back to their output
+    /// at stop (the `target.node` entry to that output stays), but the next start of the app
+    /// uses the default output.
     pub fn restore_all(
         &mut self,
         metadata: &Metadata,
         targets: &mut BTreeMap<u32, MetaValue>,
+        node_targets: &mut BTreeMap<u32, String>,
         now: Instant,
     ) {
         if let Some(serial) = self.sink_global.as_ref().map(|s| s.serial.clone()) {
@@ -293,6 +374,16 @@ impl Session {
                 .collect();
             for node_id in to_sink {
                 write_target(metadata, targets, node_id, None);
+            }
+        }
+        if let Some(sink_node) = self.sink_global.as_ref().map(|s| s.id.to_string()) {
+            let to_sink: Vec<u32> = node_targets
+                .iter()
+                .filter(|(_, value)| **value == sink_node)
+                .map(|(id, _)| *id)
+                .collect();
+            for node_id in to_sink {
+                clear_target_node(metadata, node_targets, node_id);
             }
         }
     }
@@ -349,5 +440,46 @@ fn write_target(
             metadata.set_property(node_id, TARGET_OBJECT, None, None);
             targets.remove(&node_id);
         }
+    }
+}
+
+/// Deletes the `target.node` entry of `node_id` and records it.
+fn clear_target_node(metadata: &Metadata, node_targets: &mut BTreeMap<u32, String>, node_id: u32) {
+    metadata.set_property(node_id, TARGET_NODE, None, None);
+    node_targets.remove(&node_id);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_waiting_start_answers_with_the_failure_or_the_stage_that_timed_out() {
+        // A failure answers at once and wins over the timeout text.
+        let failed = start_error(Some("The Beatsync sink was removed"), true, false);
+        assert_eq!(failed.as_deref(), Some("The Beatsync sink was removed"));
+        assert_eq!(start_error(None, false, false), None);
+        assert_eq!(start_error(None, true, false), None);
+        assert_eq!(
+            start_error(None, false, true).as_deref(),
+            Some("The Beatsync sink did not appear")
+        );
+        assert_eq!(
+            start_error(None, true, true).as_deref(),
+            Some("WirePlumber did not set up the Beatsync sink")
+        );
+    }
+
+    #[test]
+    fn only_a_monitor_port_of_the_sink_makes_it_ready() {
+        // A monitor port of another node (a device plugged in during the start) would start
+        // the capture before WirePlumber 0.4 has an item for the sink.
+        ::pipewire::init();
+        let monitor = properties! { "node.id" => "42", "port.monitor" => "true" };
+        let other = properties! { "node.id" => "43", "port.monitor" => "true" };
+        let playback = properties! { "node.id" => "42", "port.name" => "playback_FL" };
+        assert!(is_monitor_port_of(monitor.as_ref(), 42));
+        assert!(!is_monitor_port_of(other.as_ref(), 42), "another node");
+        assert!(!is_monitor_port_of(playback.as_ref(), 42), "an input port");
     }
 }

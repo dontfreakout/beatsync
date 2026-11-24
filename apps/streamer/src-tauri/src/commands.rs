@@ -33,7 +33,7 @@ pub type CommandResult<T> = Result<T, String>;
 pub struct AppState {
     /// Kept for the app's lifetime: dropping the PipeWire backend joins its thread, which must
     /// not happen on a runtime worker. `Err` is the creation error that the UI shows in place
-    /// of the app list (e.g. `PipeWire 1.0 and WirePlumber 0.5 or later required`).
+    /// of the app list (e.g. `PipeWire 1.0 and WirePlumber 0.4.17 or later required`).
     backend: Result<Arc<dyn AudioBackend>, String>,
     session: tokio::sync::Mutex<Session>,
     status_hub: Arc<LatestHub<Status>>,

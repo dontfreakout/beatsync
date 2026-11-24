@@ -60,14 +60,20 @@ fn playback_properties(target: Option<&str>) -> PropertiesBox {
         *pw::keys::NODE_LATENCY => LATENCY,
         // Excluded from the app list and from routing.
         *pw::keys::APP_NAME => OWN_APP_NAME,
-        // Without a stored target the stream always follows the default output.
+        // Without a stored target the stream always follows the default output. WirePlumber
+        // 0.4 ignores these string flags (spec 8.3, accepted difference): a volume set on the
+        // stream outside the app comes back on the next run, and a playback that was moved
+        // outside the app can go to that output on the next run.
         "state.restore-props" => "false",
         "state.restore-target" => "false",
     };
     if let Some(target) = target {
         props.insert(*pw::keys::TARGET_OBJECT, target);
-        // A missing target must never send the sound to the default output.
+        // A missing target must never send the sound to the default output, and the session
+        // manager must not move the stream. WirePlumber 0.4 knows only `node.dont-reconnect`,
+        // 0.5 knows both keys; a move from outside the app is ignored.
         props.insert("node.dont-fallback", "true");
+        props.insert("node.dont-reconnect", "true");
     }
     props
 }
@@ -187,6 +193,19 @@ mod tests {
     use super::*;
 
     const MS: i64 = 1_000_000;
+
+    #[test]
+    fn only_a_pinned_output_refuses_other_targets() {
+        ::pipewire::init();
+        let pinned = playback_properties(Some("beatsync-test-out"));
+        assert_eq!(pinned.get("node.dont-fallback"), Some("true"));
+        assert_eq!(pinned.get("node.dont-reconnect"), Some("true"));
+        // C3: without a target the output follows the default output, also when it changes.
+        let follows = playback_properties(None);
+        assert_eq!(follows.get("target.object"), None);
+        assert_eq!(follows.get("node.dont-fallback"), None);
+        assert_eq!(follows.get("node.dont-reconnect"), None);
+    }
 
     #[test]
     fn heard_at_adds_device_delay_and_resampler_frames() {

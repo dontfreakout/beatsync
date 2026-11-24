@@ -122,6 +122,9 @@ S3_SECRET_ACCESS_KEY=
 - **Docker**: Multi-stage build with `oven/bun:1`. Exposes port 8080. Entry: `bun start`.
 - **PM2**: Config in `pm2.config.js`. Process name: `beatsync-server`.
 - Server has graceful shutdown (SIGTERM/SIGINT) that backs up state to R2 before exit.
+- **Streamer Linux bundles** (`apps/streamer`): build bundles for other people with `bun run app:build:linux` (Ubuntu 24.04 container, runs on glibc 2.39+, output in `target/linux-release/`). A host `bun run app:build` bundles the host's GTK/WebKit libraries, and the AppImage then fails on older distributions with "version `GLIBC_2.xx' not found".
+- `bun run core:test:ubuntu24` runs the streamer-core unit tests and the PipeWire integration tests against PipeWire 1.0.5 and WirePlumber 0.4.17 in a container.
+- `bun run app:check:mint [IMAGE]` starts the container-built AppImage in an official Linux Mint image (default `docker.io/linuxmintd/mint22.3-amd64`, also `mint23-amd64`) and needs "audio backend ready". Run `app:build:linux` first.
 
 ## Development Notes
 

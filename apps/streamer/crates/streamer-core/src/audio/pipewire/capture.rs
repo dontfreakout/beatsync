@@ -40,12 +40,23 @@ fn capture_properties(target: &str) -> PropertiesBox {
         *pw::keys::MEDIA_CATEGORY => "Capture",
         *pw::keys::STREAM_CAPTURE_SINK => "true",
         *pw::keys::TARGET_OBJECT => target,
-        // Never fall back to a microphone or another sink if the target is missing.
+        // Never fall back to a microphone or another sink if the target is missing, and never
+        // let the session manager move the capture. WirePlumber 0.4 knows only
+        // `node.dont-reconnect`; 0.5 knows both keys. Both are set so that one set of
+        // properties works on both; a move from outside the app is ignored (spec F3).
+        //
+        // Known 0.4 limit: a capture that starts within 2 s after a Bluetooth node was removed
+        // is destroyed. The 0.4.17 `policy-node.lua` skips the link during the Bluetooth window
+        // (:772) but still sets `was_handled` (:839); the next rescan (:783, `dont-reconnect`
+        // and `was_handled`) clears the target and the policy destroys the node. It fails safe:
+        // the user sees the capture error and starts again.
         "node.dont-fallback" => "true",
+        "node.dont-reconnect" => "true",
         *pw::keys::NODE_LATENCY => LATENCY,
         // Excluded from the app list and from routing.
         *pw::keys::APP_NAME => OWN_APP_NAME,
         // WirePlumber stores nothing for it, so it never restores a stale per-run target.
+        // WirePlumber 0.4 ignores these string flags (spec 8.3, accepted difference).
         "state.restore-props" => "false",
         "state.restore-target" => "false",
     }
@@ -214,6 +225,16 @@ mod tests {
     use super::*;
 
     const MS: i64 = 1_000_000;
+
+    #[test]
+    fn the_capture_never_takes_another_source() {
+        ::pipewire::init();
+        let props = capture_properties("beatsync-1-1");
+        assert_eq!(props.get("target.object"), Some("beatsync-1-1"));
+        // 0.4 knows only `node.dont-reconnect`; 0.5 knows both (spec F3).
+        assert_eq!(props.get("node.dont-fallback"), Some("true"));
+        assert_eq!(props.get("node.dont-reconnect"), Some("true"));
+    }
 
     fn timing(delay: i64, buffered: u64, rate_denom: u32) -> Timing {
         Timing {

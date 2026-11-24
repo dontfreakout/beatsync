@@ -25,9 +25,11 @@ use pw::types::ObjectType;
 
 use super::capture::connect_capture;
 use super::playback::{NO_LOCAL_OUTPUT, PlaybackStream, connect_playback, local_copy_allowed};
-use super::routing::{Session, SinkGlobal, sink_name, sink_properties};
+use super::routing::{
+    Session, SinkGlobal, is_monitor_port_of, sink_name, sink_properties, start_error,
+};
 use super::{INIT_TIMEOUT, OWN_APP_NAME, SINK_TIMEOUT, STOP_TIMEOUT};
-use crate::audio::apps::{MetaValue, StreamNode, check_versions, group_apps};
+use crate::audio::apps::{MetaValue, StreamNode, WirePlumber, check_versions, group_apps};
 use crate::audio::{AppInfo, AudioError, AudioEvent, AudioIo, OutputIo};
 use crate::mixer::Mixer;
 
@@ -76,6 +78,19 @@ pub(super) enum Command {
     #[cfg(test)]
     FakeDefaultSink {
         value: String,
+        reply: Reply<()>,
+    },
+    /// Destroys the session's sink through its proxy, with the capture still connected: the
+    /// sink disappears as if another client removed it. PipeWire before 1.3.81 aborts when
+    /// another client destroys a null sink whose owner is still connected (`pw-cli destroy`,
+    /// PipeWire issue 4250).
+    #[cfg(test)]
+    DropSink(Reply<()>),
+    /// Destroys the sink `name` of [`Command::CreateSink`] through its proxy (a pinned
+    /// output loses its target). Not `pw-cli destroy`: see [`Command::DropSink`].
+    #[cfg(test)]
+    DropTestSink {
+        name: String,
         reply: Reply<()>,
     },
 }
@@ -127,6 +142,9 @@ struct Inbox {
     streams_changed: bool,
     /// `target.object` entries of the `default` metadata by subject.
     targets: BTreeMap<u32, MetaValue>,
+    /// `target.node` entries of the `default` metadata by subject (WirePlumber 0.4's
+    /// stream-restore writes them; the value is a node id). Not part of `targets_changed`.
+    node_targets: BTreeMap<u32, String>,
     /// Raw seqs of `done` events for `core.sync`.
     done: Vec<i32>,
     errors: Vec<CoreError>,
@@ -292,14 +310,15 @@ pub(super) fn run(
     drop(main_loop);
 }
 
-/// Globals the worker uses: nodes (streams and the sink), the `default` metadata and the
-/// WirePlumber client.
+/// Globals the worker uses: nodes (streams and the sink), monitor ports (the sink is ready
+/// once it has them), the `default` metadata and the WirePlumber client.
 fn is_relevant(global: &GlobalObject<&DictRef>) -> bool {
     let Some(props) = global.props else {
         return false;
     };
     match global.type_ {
         ObjectType::Node => true,
+        ObjectType::Port => props.get("port.monitor") == Some("true"),
         ObjectType::Metadata => props.get("metadata.name") == Some("default"),
         ObjectType::Client => props.get("application.name") == Some("WirePlumber"),
         _ => false,
@@ -347,7 +366,7 @@ struct Worker {
     media_created: u64,
     /// Sinks of [`Command::CreateSink`]; dropping a proxy destroys its sink.
     #[cfg(test)]
-    test_sinks: Vec<Node>,
+    test_sinks: Vec<(String, Node)>,
     /// The `default.audio.sink` value of [`Command::FakeDefaultSink`].
     #[cfg(test)]
     fake_default_sink: Option<String>,
@@ -520,7 +539,16 @@ impl Worker {
                     session.sink_global = Some(SinkGlobal {
                         id: global.id,
                         serial: serial.to_string(),
+                        monitor: false,
                     });
+                }
+            }
+            ObjectType::Port => {
+                if let Some(session) = &mut self.session
+                    && let Some(sink) = &mut session.sink_global
+                    && is_monitor_port_of(props, sink.id)
+                {
+                    sink.monitor = true;
                 }
             }
             ObjectType::Metadata => self.bind_metadata(global),
@@ -589,16 +617,19 @@ impl Worker {
                         inbox.default_sink_changed = true;
                     }
                     let targets = &mut inbox.targets;
+                    let node_targets = &mut inbox.node_targets;
                     match (key, value) {
                         // `clear()` of the whole metadata, or of one subject.
                         (None, _) if subject == pw::constants::ID_ANY => {
                             targets.clear();
+                            node_targets.clear();
                             inbox.default_sink = None;
                             inbox.default_sink_changed = true;
                             inbox.targets_changed = true;
                         }
                         (None, _) => {
                             targets.remove(&subject);
+                            node_targets.remove(&subject);
                             inbox.targets_changed = true;
                         }
                         (Some("target.object"), Some(value)) => {
@@ -613,6 +644,12 @@ impl Worker {
                             targets.remove(&subject);
                             inbox.targets_changed = true;
                         }
+                        (Some("target.node"), Some(value)) => {
+                            node_targets.insert(subject, value.to_string());
+                        }
+                        (Some("target.node"), None) => {
+                            node_targets.remove(&subject);
+                        }
                         _ => {}
                     }
                     0
@@ -622,6 +659,7 @@ impl Worker {
         {
             let mut inbox = self.inbox.borrow_mut();
             inbox.targets.clear();
+            inbox.node_targets.clear();
             inbox.default_sink = None;
         }
         self.metadata = Some(DefaultMetadata {
@@ -670,7 +708,10 @@ impl Worker {
         self.wireplumber.remove(&id);
         if self.metadata.as_ref().is_some_and(|m| m.id == id) {
             self.metadata = None;
-            self.inbox.borrow_mut().targets.clear();
+            let mut inbox = self.inbox.borrow_mut();
+            inbox.targets.clear();
+            inbox.node_targets.clear();
+            drop(inbox);
             if let Some(session) = &mut self.session {
                 session.fail("The PipeWire session manager stopped");
             }
@@ -706,7 +747,14 @@ impl Worker {
                 (None, None) => Err(AudioError::Unavailable(
                     "the PipeWire server did not answer".to_string(),
                 )),
-                (None, Some(version)) => check_versions(version, inbox.wp_version.as_deref()),
+                (None, Some(version)) => {
+                    let wireplumber = match (self.wireplumber.is_empty(), &inbox.wp_version) {
+                        (true, _) => WirePlumber::Missing,
+                        (false, Some(version)) => WirePlumber::Version(version),
+                        (false, None) => WirePlumber::Unversioned,
+                    };
+                    check_versions(version, wireplumber)
+                }
             }
         };
         if result.is_err() {
@@ -766,13 +814,25 @@ impl Worker {
                     let sink = self
                         .core
                         .create_object::<Node>("adapter", &sink_properties(&name));
-                    let result = sink.map(|sink| self.test_sinks.push(sink));
+                    let result = sink.map(|sink| self.test_sinks.push((name, sink)));
                     let _ = reply.send(result.map_err(|e| AudioError::Backend(e.to_string())));
                 }
                 #[cfg(test)]
                 Command::FakeDefaultSink { value, reply } => {
                     self.fake_default_sink = Some(value);
                     self.guard_local_output();
+                    let _ = reply.send(Ok(()));
+                }
+                #[cfg(test)]
+                Command::DropSink(reply) => {
+                    if let Some(session) = &mut self.session {
+                        session.drop_sink();
+                    }
+                    let _ = reply.send(Ok(()));
+                }
+                #[cfg(test)]
+                Command::DropTestSink { name, reply } => {
+                    self.test_sinks.retain(|(sink, _)| *sink != name);
                     let _ = reply.send(Ok(()));
                 }
             }
@@ -838,7 +898,8 @@ impl Worker {
         ));
     }
 
-    /// Answers the start once the sink is in the registry, after the first routing.
+    /// Answers the start once the sink is ready, so WirePlumber 0.4 can link the capture (see
+    /// [`Session::sink_ready`]); then routes and creates the capture.
     fn progress_start(&mut self, now: Instant) {
         let Some(session) = &mut self.session else {
             return;
@@ -846,7 +907,7 @@ impl Worker {
         let Some((deadline, _)) = &session.pending_start else {
             return;
         };
-        if session.sink_global.is_some() {
+        if session.sink_ready() {
             if session.answer_start(Ok(())) {
                 self.route(now);
                 self.start_media();
@@ -854,10 +915,10 @@ impl Worker {
                 // The caller stopped waiting: undo rather than keep a session nobody owns.
                 self.begin_stop(None, now);
             }
-        } else if now >= *deadline {
-            session.answer_start(Err(AudioError::Backend(
-                "The Beatsync sink did not appear".to_string(),
-            )));
+        } else if let Some(message) =
+            start_error(session.failure(), session.sink_known(), now >= *deadline)
+        {
+            session.answer_start(Err(AudioError::Backend(message)));
             self.session = None;
         }
     }
@@ -879,7 +940,7 @@ impl Worker {
         }
     }
 
-    /// Creates the capture of the sink's monitor once the sink exists and the first routing
+    /// Creates the capture of the sink's monitor once the sink is ready and the first routing
     /// ran. When the default output is one of our sinks, the session fails with no capture:
     /// the output, which follows the default output, would play into the capture.
     fn start_media(&mut self) {
@@ -1021,7 +1082,14 @@ impl Worker {
         };
         if session.is_routing() {
             let mut inbox = self.inbox.borrow_mut();
-            session.route(&metadata.bound.proxy, &nodes, &mut inbox.targets, now);
+            let inbox = &mut *inbox;
+            session.route(
+                &metadata.bound.proxy,
+                &nodes,
+                &mut inbox.targets,
+                &mut inbox.node_targets,
+                now,
+            );
         }
     }
 
@@ -1041,7 +1109,13 @@ impl Worker {
             && let Some(metadata) = &self.metadata
         {
             let mut inbox = self.inbox.borrow_mut();
-            session.restore_all(&metadata.bound.proxy, &mut inbox.targets, now);
+            let inbox = &mut *inbox;
+            session.restore_all(
+                &metadata.bound.proxy,
+                &mut inbox.targets,
+                &mut inbox.node_targets,
+                now,
+            );
         }
         drop(session);
         let sync = if self.lost.is_none() {

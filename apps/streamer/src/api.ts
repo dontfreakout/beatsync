@@ -67,7 +67,7 @@ export const setNudge = (nudgeMs: number) => invoke<Settings>("set_nudge", { nud
 /** Sends a room action; rejects while disconnected or for a type the core sends itself. */
 export const sendAction = (action: WSRequestType) => invoke<void>("send_action", { action });
 
-/** Rejects with the backend error, e.g. "PipeWire 1.0 and WirePlumber 0.5 or later required". */
+/** Rejects with the backend error, e.g. "PipeWire 1.0 and WirePlumber 0.4.17 or later required". */
 export const listApps = () => invoke<AppInfo[]>("list_apps");
 
 /** Saves the selection, starts the stream and returns the saved settings. */
