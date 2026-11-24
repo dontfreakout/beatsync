@@ -49,7 +49,10 @@ pub(super) fn sink_properties(node_name: &str) -> PropertiesBox {
         // WirePlumber picks the default output and input by this priority (real devices
         // have 1000 and more), so the sink never becomes a default.
         "priority.session" => "0",
-        // Keeps per-run entries out of WirePlumber's stream-properties state file.
+        // Keeps per-run entries out of WirePlumber's stream-properties state file. This holds on
+        // WirePlumber 0.5. WirePlumber 0.4 ignores the string value "false", so its state file
+        // (`restore-stream`) grows by a few lines per run. That is accepted: a stable sink name
+        // would let 0.4 restore apps onto the next run's sink, which is worse.
         "state.restore-props" => "false",
     }
 }
@@ -67,6 +70,30 @@ pub(super) struct SinkGlobal {
 pub(super) fn is_monitor_port_of(props: &DictRef, sink_id: u32) -> bool {
     props.get("port.monitor") == Some("true")
         && props.get("node.id") == Some(sink_id.to_string().as_str())
+}
+
+/// The error for a start that waits for the sink, or `None` while it keeps waiting. A failed
+/// session answers at once with its own reason. At the deadline the message tells where the
+/// wait stopped: the sink node never appeared, or WirePlumber did not finish setting it up.
+pub(super) fn start_error(
+    failure: Option<&str>,
+    sink_known: bool,
+    deadline_passed: bool,
+) -> Option<String> {
+    if let Some(reason) = failure {
+        return Some(reason.to_string());
+    }
+    if !deadline_passed {
+        return None;
+    }
+    Some(
+        if sink_known {
+            "WirePlumber did not set up the Beatsync sink"
+        } else {
+            "The Beatsync sink did not appear"
+        }
+        .to_string(),
+    )
 }
 
 /// One start..stop run: the sink, its capture, the selection and the streams moved to the
@@ -88,7 +115,8 @@ pub(super) struct Session {
     route_at: Option<Instant>,
     /// Answered when the sink is ready (see [`Session::sink_ready`]).
     pub pending_start: Option<(Instant, Reply<()>)>,
-    failed: bool,
+    /// The reason of the first failure, once the session failed.
+    failed: Option<String>,
     events: tokio::sync::mpsc::UnboundedSender<AudioEvent>,
     pub shared: Arc<PlayoutShared>,
     /// The capture ring's end, until the capture stream takes it.
@@ -122,7 +150,7 @@ impl Session {
             added: BTreeMap::new(),
             route_at: None,
             pending_start: Some((start_deadline, reply)),
-            failed: false,
+            failed: None,
             events,
             shared,
             capture_tx: Some(capture_tx),
@@ -140,9 +168,19 @@ impl Session {
         self.sink_global.as_ref().is_some_and(|s| s.monitor)
     }
 
+    /// Why the session failed, if it did.
+    pub fn failure(&self) -> Option<&str> {
+        self.failed.as_deref()
+    }
+
+    /// Whether the sink node is in the registry (its monitor port may not be).
+    pub fn sink_known(&self) -> bool {
+        self.sink_global.is_some()
+    }
+
     /// Routing runs once the sink exists and until a failure.
     pub fn is_routing(&self) -> bool {
-        self.sink_global.is_some() && self.pending_start.is_none() && !self.failed
+        self.sink_global.is_some() && self.pending_start.is_none() && self.failed.is_none()
     }
 
     pub fn route_at(&self) -> Option<Instant> {
@@ -242,8 +280,8 @@ impl Session {
 
     /// Reports a failure to the runtime once and stops routing.
     pub fn fail(&mut self, message: &str) {
-        if !self.failed {
-            self.failed = true;
+        if self.failed.is_none() {
+            self.failed = Some(message.to_string());
             let _ = self.events.send(AudioEvent::Failed(message.to_string()));
         }
     }
@@ -414,6 +452,23 @@ fn clear_target_node(metadata: &Metadata, node_targets: &mut BTreeMap<u32, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_waiting_start_answers_with_the_failure_or_the_stage_that_timed_out() {
+        // A failure answers at once and wins over the timeout text.
+        let failed = start_error(Some("The Beatsync sink was removed"), true, false);
+        assert_eq!(failed.as_deref(), Some("The Beatsync sink was removed"));
+        assert_eq!(start_error(None, false, false), None);
+        assert_eq!(start_error(None, true, false), None);
+        assert_eq!(
+            start_error(None, false, true).as_deref(),
+            Some("The Beatsync sink did not appear")
+        );
+        assert_eq!(
+            start_error(None, true, true).as_deref(),
+            Some("WirePlumber did not set up the Beatsync sink")
+        );
+    }
 
     #[test]
     fn only_a_monitor_port_of_the_sink_makes_it_ready() {

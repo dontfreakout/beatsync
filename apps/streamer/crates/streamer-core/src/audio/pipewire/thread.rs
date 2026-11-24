@@ -25,7 +25,9 @@ use pw::types::ObjectType;
 
 use super::capture::connect_capture;
 use super::playback::{NO_LOCAL_OUTPUT, PlaybackStream, connect_playback, local_copy_allowed};
-use super::routing::{Session, SinkGlobal, is_monitor_port_of, sink_name, sink_properties};
+use super::routing::{
+    Session, SinkGlobal, is_monitor_port_of, sink_name, sink_properties, start_error,
+};
 use super::{INIT_TIMEOUT, OWN_APP_NAME, SINK_TIMEOUT, STOP_TIMEOUT};
 use crate::audio::apps::{MetaValue, StreamNode, WirePlumber, check_versions, group_apps};
 use crate::audio::{AppInfo, AudioError, AudioEvent, AudioIo, OutputIo};
@@ -913,10 +915,10 @@ impl Worker {
                 // The caller stopped waiting: undo rather than keep a session nobody owns.
                 self.begin_stop(None, now);
             }
-        } else if now >= *deadline {
-            session.answer_start(Err(AudioError::Backend(
-                "The Beatsync sink did not appear".to_string(),
-            )));
+        } else if let Some(message) =
+            start_error(session.failure(), session.sink_known(), now >= *deadline)
+        {
+            session.answer_start(Err(AudioError::Backend(message)));
             self.session = None;
         }
     }
