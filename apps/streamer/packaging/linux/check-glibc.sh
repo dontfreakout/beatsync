@@ -21,28 +21,46 @@ shift
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
-# Prints the files of one bundle as a directory.
+# Fails with a clear message when a tool is missing or an unpack command fails.
+die() {
+  echo "check-glibc: $*" >&2
+  exit 2
+}
+
+need() {
+  command -v "$1" >/dev/null || die "$1 is needed to unpack $2 but is not installed"
+}
+
+# Sets UNPACKED to a directory with the files of one bundle. It runs in the main shell, not in
+# $(...): there `set -e` does not stop the script when an unpack command fails.
 unpack() {
-  local bundle dir
+  local bundle
   bundle=$(realpath "$1") # absolute: the cases below change directory
   if [[ -d $bundle ]]; then
-    echo "$bundle"
+    UNPACKED=$bundle
     return
   fi
-  dir=$(mktemp -d "$work/unpack.XXXXXX")
+  UNPACKED=$(mktemp -d "$work/unpack.XXXXXX")
   case $bundle in
     *.AppImage)
       # The AppImage runtime extracts into ./squashfs-root.
-      (cd "$dir" && "$bundle" --appimage-extract >/dev/null)
+      (cd "$UNPACKED" && "$bundle" --appimage-extract >/dev/null) ||
+        die "cannot extract $bundle"
       ;;
-    *.deb) dpkg-deb -x "$bundle" "$dir" ;;
-    *.rpm) (cd "$dir" && rpm2cpio "$bundle" | cpio -id --quiet) ;;
-    *)
-      echo "unknown bundle type: $bundle" >&2
-      exit 2
+    *.deb)
+      need dpkg-deb "$bundle"
+      dpkg-deb -x "$bundle" "$UNPACKED" || die "cannot unpack $bundle"
       ;;
+    *.rpm)
+      need rpm2cpio "$bundle"
+      need cpio "$bundle"
+      # No pipefail: Ubuntu's rpm2cpio script exits 1 after it wrote the whole archive. A broken
+      # file still fails in cpio, or leaves no ELF file (checked below).
+      (cd "$UNPACKED" && set +o pipefail && rpm2cpio "$bundle" | cpio -id --quiet) ||
+        die "cannot unpack $bundle"
+      ;;
+    *) die "unknown bundle type: $bundle" ;;
   esac
-  echo "$dir"
 }
 
 # True when glibc MAX_GLIBC defines the symbol version $1.
@@ -59,10 +77,13 @@ allowed() {
 
 failed=0
 for bundle in "$@"; do
-  dir=$(unpack "$bundle")
+  unpack "$bundle"
+  dir=$UNPACKED
   highest=""
+  elf_files=0
   while IFS= read -r -d '' file; do
     head -c 4 "$file" 2>/dev/null | grep -q $'^\x7fELF' || continue
+    elf_files=$((elf_files + 1))
     # Only the "Version needs" section names what the loader must find.
     needs=$(readelf -V -W "$file" 2>/dev/null |
       awk '/^Version needs section/ { on = 1; next }
@@ -81,6 +102,7 @@ for bundle in "$@"; do
       failed=1
     fi
   done < <(find "$dir" -type f -print0)
+  [[ $elf_files -gt 0 ]] || die "no ELF file in $bundle: the unpack gave nothing to check"
   echo "$(basename "$bundle"): needs glibc ${highest:-(none)}"
 done
 
