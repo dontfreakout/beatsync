@@ -22,7 +22,9 @@ pub const OWN_APP_NAME: &str = "Beatsync Streamer";
 
 /// Wait for the core info and the WirePlumber client at startup.
 const INIT_TIMEOUT: Duration = Duration::from_secs(2);
-/// Wait for the sink and a monitor port of it to show up in the registry.
+/// Wait for the sink and a monitor port of it to show up in the registry. The monitor port
+/// comes only after WirePlumber has activated the sink, so the wait includes that: the start
+/// waits for the port before it connects the capture (see `progress_start`).
 const SINK_TIMEOUT: Duration = Duration::from_secs(2);
 /// Wait for the server to confirm the restore and the sink removal.
 const STOP_TIMEOUT: Duration = Duration::from_secs(2);
@@ -1269,8 +1271,12 @@ mod tests {
     #[test]
     #[ignore = "needs a live PipeWire session"]
     fn capture_links_on_every_start() {
-        // With node.dont-reconnect, WirePlumber 0.4 destroys a capture whose new sink has no
-        // session item yet; its one rescan runs at once. Fails often under CPU load.
+        // Guards the start gate in `progress_start`. Without the wait for the sink's monitor
+        // port, WirePlumber 0.4 now and then destroys the capture ("target not found"): it
+        // handles the capture before the sink has a session item. The race shows mostly under
+        // CPU load. To reproduce, loop this test in the 0.4 container (`bun run
+        // core:test:ubuntu24` image) while the host runs `cargo build --workspace --all-targets`
+        // in a loop; a start without the gate fails in most runs.
         let _lock = lock();
         let backend = PipeWireBackend::new().expect("backend");
         for round in 0..10 {

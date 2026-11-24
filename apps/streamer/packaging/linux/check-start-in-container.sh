@@ -38,6 +38,7 @@ if [[ ${1:-} == check ]]; then
   sleep 5
   if grep -Eq "$bad" "$log"; then fail "the app reported an error"; fi
   kill -0 "$app" 2>/dev/null || fail "the app exited after the audio backend was ready"
+  grep "streamer-app: audio backend ready" "$log" | head -n 1
   echo "OK: the app started and the audio backend is ready"
   exit 0
 fi

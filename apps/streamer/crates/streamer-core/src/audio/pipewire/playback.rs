@@ -70,8 +70,8 @@ fn playback_properties(target: Option<&str>) -> PropertiesBox {
     if let Some(target) = target {
         props.insert(*pw::keys::TARGET_OBJECT, target);
         // A missing target must never send the sound to the default output, and the session
-        // manager must not move the stream. WirePlumber 0.5 knows only the first key, 0.4 only
-        // the second; a move from outside the app is ignored.
+        // manager must not move the stream. WirePlumber 0.4 knows only `node.dont-reconnect`,
+        // 0.5 knows both keys; a move from outside the app is ignored.
         props.insert("node.dont-fallback", "true");
         props.insert("node.dont-reconnect", "true");
     }
