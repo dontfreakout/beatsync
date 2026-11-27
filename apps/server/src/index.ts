@@ -106,7 +106,11 @@ const server = Bun.serve<WSData>({
       void handleMessage(ws, message, server);
     },
 
-    close(ws) {
+    close(ws, code, reason) {
+      // DIAG (temporary): why did the socket close?
+      console.log(
+        `[${new Date().toISOString()}] [ws-close] user=${ws.data.username} kind=${ws.data.kind} client=${ws.data.clientId} code=${code} reason=${reason || "-"} buffered=${ws.getBufferedAmount()}`
+      );
       handleClose(ws, server);
     },
   },

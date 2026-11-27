@@ -3,7 +3,7 @@ import { useGlobalStore, MAX_NTP_MEASUREMENTS } from "@/store/global";
 import { NTP_CONSTANTS } from "@beatsync/shared";
 
 interface UseNtpHeartbeatProps {
-  onConnectionStale?: () => void;
+  onConnectionStale?: (reason: string) => void;
 }
 
 export const useNtpHeartbeat = ({ onConnectionStale }: UseNtpHeartbeatProps) => {
@@ -32,9 +32,11 @@ export const useNtpHeartbeat = ({ onConnectionStale }: UseNtpHeartbeatProps) => 
     ntpTimerRef.current = window.setTimeout(() => {
       // Check if we have a pending request that timed out BEFORE resetting timer
       if (lastNtpRequestTime.current && Date.now() - lastNtpRequestTime.current > NTP_CONSTANTS.RESPONSE_TIMEOUT_MS) {
+        const waitedMs = Date.now() - lastNtpRequestTime.current;
         console.error("NTP request timed out - connection may be stale");
         // Notify parent component that connection is stale
-        onConnectionStale?.();
+        // DIAG (temporary): report how long the request waited and how late this timer fired
+        onConnectionStale?.(`ntp-stale waited=${waitedMs}ms interval=${interval}ms`);
         return; // Don't send another request or schedule next
       }
 

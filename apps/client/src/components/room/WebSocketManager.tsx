@@ -32,10 +32,11 @@ export const WebSocketManager = ({ roomId, username }: WebSocketManagerProps) =>
 
   // Use the NTP heartbeat hook
   const { startHeartbeat, stopHeartbeat, markNTPResponseReceived } = useNtpHeartbeat({
-    onConnectionStale: () => {
+    onConnectionStale: (reason) => {
       const currentSocket = useGlobalStore.getState().socket;
       if (currentSocket && currentSocket.readyState === WebSocket.OPEN) {
-        currentSocket.close();
+        // DIAG (temporary): code 4001 + reason reach the server log
+        currentSocket.close(4001, reason);
       }
     },
   });
@@ -70,7 +71,8 @@ export const WebSocketManager = ({ roomId, username }: WebSocketManagerProps) =>
       socket.onerror = () => {};
       socket.onmessage = () => {};
       socket.onopen = () => {};
-      socket.close();
+      // DIAG (temporary): mark client-side replacement in the server log
+      socket.close(4002, "replaced-by-new-connection");
     }
 
     const ws = new WebSocket(SOCKET_URL);
